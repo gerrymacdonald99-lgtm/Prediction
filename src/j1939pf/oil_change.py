@@ -140,6 +140,10 @@ def detect_oil_changes(prep: Prepared, params: dict, events: pd.DataFrame | None
     rpm = df["engine_speed_rpm"].to_numpy(dtype=float)
     okt = np.isfinite(oil_t)
     okd = np.isfinite(dpv) if dpv is not None else None
+    seg_first = pd.Series(np.arange(n)).groupby(seg).transform("first").to_numpy()
+    # b starts the first running period of its segment?
+    first_run_in_seg = pd.Series(np.where(running, np.arange(n), n)).groupby(seg).transform("min").to_numpy()
+    new_seg_start = np.arange(n) == first_run_in_seg
     rows = []
     for b in starts:
         before = run_idx[run_idx < b]
@@ -168,8 +172,12 @@ def detect_oil_changes(prep: Prepared, params: dict, events: pd.DataFrame | None
             rec["level_step_pct"] = float(np.median(c) - np.median(a)) if a.size >= 10 and c.size >= 10 else np.nan
         if dpv is not None:
             rec["filter_dp_step_rel"] = _bin_step(keys, dpv, pre[okd[pre]], post[okd[post]], oc["min_bin_samples"])[0]
-        z0 = vals[pre_r[stopped[pre_r]]]
-        z1 = vals[post_r[stopped[post_r]]]
+        # engine-off (zero) readings: the new session's key-on rows come BEFORE its first running row, so split
+        # at the session start (or, for a stop inside a session, at the last running row before it)
+        split = int(seg_first[b]) if new_seg_start[b] else int(before[-1]) + 1
+        zr0, zr1 = np.arange(i0, split), np.arange(split, i1)
+        z0 = vals[zr0[stopped[zr0]]]
+        z1 = vals[zr1[stopped[zr1]]]
         z0, z1 = z0[np.isfinite(z0)], z1[np.isfinite(z1)]
         rec["zero_shift_kpa"] = float(np.median(z1) - np.median(z0)) if z0.size >= 3 and z1.size >= 3 else np.nan
         rows.append(rec)

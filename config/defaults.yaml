@@ -98,3 +98,60 @@ derived:
   exposure_z_min: 2.0            # oil pressure below its own baseline counts from z <= -2
   fault_cluster_gap_h: 2.0       # DTC episodes starting within this many engine hours form a cluster
   period_h: 50                   # exposure rates are also reported per period of this many engine hours
+  regen_drop_frac: 0.7           # inferred DPF regen: soot index (dp / fuel rate) falls below this x recent max
+  regen_lookback: 4              # ... of the previous N half-hour windows
+  regen_min_gap_h: 3
+  regen_min_flow_frac: 0.6       # ... using only rows at >= this x the engine's 95th-percentile fuel rate
+
+# ---------------------------------------------------------------------------
+# Change-points (phase 4). TUNABLE program defaults.
+changepoints:
+  relearn_h: 10                  # engine hours after a grade change / sensor replacement used to measure the step;
+                                 # learned layers do not judge the signal meanwhile (flagged transition)
+  pre_window_h: 10               # engine hours before the change-point it is compared with
+  min_bins: 5
+  min_bin_samples: 10
+  max_step_rel: 0.15             # a viscosity (grade) step larger than this is NOT absorbed
+  max_step_add_kpa: 30           # a sensor offset step larger than this is NOT absorbed
+  season_shift_c: 10             # ambient median shift (per period) reported as a season transition
+  oil_reset_frac: 0.5            # a low drift that falls below this fraction of the alert level after an oil
+                                 # change is annotated as consistent with oil ageing
+
+# Feedback loop (phase 4)
+feedback:
+  new_evidence_factor: 1.5       # a dismissed pattern re-fires only if the deviation grows to this x its dismissed size
+  confirmed_threshold_factor: 0.75  # confirmed patterns are detected at 0.75 x the normal z / drift threshold
+
+# ---------------------------------------------------------------------------
+# Correlation discovery (phase 4). TUNABLE program defaults.
+correlations:
+  period_h: 25                   # relationships are re-checked per period of this many engine hours
+  break_z: 3.0                   # a period whose median residual is this many reference spreads off ...
+  break_periods: 2               # ... for this many consecutive periods = the learned relationship BROKE
+  bootstrap: 200                 # session-bootstrap resamples for confidence intervals (seeded)
+  max_rows: 20000                # rows sub-sampled (seeded) for rank correlations
+  min_rows: 200
+  min_points_conclusive: 8       # period / fleet relationships with fewer points are reported as inconclusive
+  curves:                        # y vs x within an operating condition; learned on the reference window
+    - {name: oil_pressure_vs_rpm, x: engine_speed_rpm, y: oil_pressure_kpa, condition: warm_oil,
+       confounders: [oil temperature (held within +-5 C of its reference median), oil age / oil changes, oil grade, pressure sensor changes]}
+    - {name: coolant_temp_vs_load, x: load, y: coolant_temp_c, condition: after_warmup,
+       confounders: [ambient temperature, fan state, coolant level, thermostat]}
+    - {name: boost_vs_fuel_rate, x: fuel_rate_lph, y: boost_kpa, condition: steady,
+       confounders: [barometric pressure / altitude, intake air temperature, gauge vs absolute boost convention]}
+    - {name: fuel_pressure_vs_fuel_rate, x: fuel_rate_lph, y: fuel_delivery_pressure_kpa, condition: steady,
+       confounders: [fuel filter age, fuel temperature, fuel tank level]}
+    - {name: turbo_speed_vs_boost, x: boost_kpa, y: turbo_speed_rpm, condition: steady,
+       confounders: [altitude, wastegate / VGT position (not decoded)]}
+    - {name: coolant_pressure_vs_coolant_temp, x: coolant_temp_c, y: coolant_pressure_kpa, condition: running,
+       confounders: [radiator cap, coolant level, air in the system]}
+    - {name: dpf_dp_vs_fuel_rate, x: fuel_rate_lph, y: dpf_dp_kpa, condition: steady,
+       confounders: [soot load / regeneration state, ash load, exhaust temperature]}
+  trends:                        # y vs engine hours (block medians within a condition)
+    - {name: oil_pressure_drift_vs_hours, y: oil_pressure_drift, condition: baseline,
+       confounders: [oil ageing within an oil interval, oil grade changes, sensor replacement]}
+    - {name: crankcase_pressure_vs_hours, y: crankcase_pressure_kpa, condition: high_load,
+       confounders: [crankcase ventilation filter, load mix, ambient pressure]}
+    - {name: oil_level_vs_hours, y: oil_level_pct, condition: running, confounders: [top-ups and oil changes, level sensor]}
+    - {name: coolant_level_vs_hours, y: coolant_level_pct, condition: running, confounders: [top-ups, temperature]}
+    - {name: dpf_ash_vs_hours, y: dpf_ash_load_pct, condition: running, confounders: [OEM ash model, DPF service]}

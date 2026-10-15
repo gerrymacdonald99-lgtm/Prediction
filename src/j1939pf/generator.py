@@ -16,6 +16,11 @@ Scenarios (fault onset is in engine hours *into the record*):
   cold_operation      healthy engine run chronically cold (thermostat stuck open, cold ambient, light load)
   abusive             healthy engine, abusive use: lugging, high load straight after a cold start,
                       shutdown straight from high load (no cool-down idle)
+  boost_leak          charge-air leak: boost (and turbo speed) low for the fuel being burned
+Other synthetic signals (toy models, for correlation discovery): boost, turbo speed, intake manifold and
+exhaust temperature, fuel delivery pressure, crankcase pressure (slow blow-by growth), coolant pressure and
+level, DPF differential pressure from a soot model with active regenerations (more soot at idle / light
+load, passive burn-off at high load), DPF ash load.
 Events (maintenance log): oil change (+filter), oil-grade change, sensor replacement. Events take effect
 at the start of a session (the engine is stopped for maintenance). Oil ageing is modelled: used oil
 slowly loses viscosity (pressure at a fixed RPM/oil temperature sags), oil level falls with consumption
@@ -33,7 +38,7 @@ from scipy.signal import lfilter
 from .spn_table import SpnTable, load_spn_table
 
 SCENARIOS = ("healthy", "bearing_wear", "clogged_filter", "stuck_relief_valve", "failing_pump",
-             "sensor_drift", "high_idle", "cold_operation", "abusive")
+             "sensor_drift", "high_idle", "cold_operation", "abusive", "boost_leak")
 NOISE_MODELS = ("gaussian", "student_t", "ar1")
 START = pd.Timestamp("2024-01-01T00:00:00Z")
 
@@ -51,6 +56,7 @@ _DEFAULT_FAULT = {
     "stuck_relief_valve": {"onset_h": 80.0, "cap_frac_of_rated": 0.5},
     "failing_pump": {"onset_h": 80.0, "full_loss_h": 300.0, "max_loss": 0.6},
     "sensor_drift": {"onset_h": 80.0, "kpa_per_h": 0.15},
+    "boost_leak": {"onset_h": 80.0, "boost_frac": 0.8},
 }
 
 
@@ -216,6 +222,10 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
     # --- temperatures (first-order lags; reset to ambient each day) ---------------
     coolant = np.empty(n)
     oil_t = np.empty(n)
+    soot = np.empty(n)
+    soot_g = float(rng.uniform(5, 20))
+    regen_left = 0.0
+    regen_rows = []
     a_c, a_o, a_off = np.exp(-dt_s / 300.0), np.exp(-dt_s / 600.0), np.exp(-dt_s / 3600.0)
     thermo = prof.thermostat_c
     for i in range(n):
@@ -231,6 +241,19 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
             c = a_off * c + (1 - a_off) * amb[i]
             o = a_off * o + (1 - a_off) * amb[i]
         coolant[i], oil_t[i] = c, o
+        # DPF soot (grams, toy model): accumulates more at idle / light load, burns off passively at high load;
+        # an active regeneration starts at 40 g and lasts ~20 min
+        if running[i]:
+            if regen_left > 0:
+                soot_g = max(2.0, soot_g - 38.0 * dt_s / 1200.0)
+                regen_left -= dt_s
+            else:
+                rate = 1.8 if lf < 0.3 else 0.7 if lf < 0.7 else -0.8
+                soot_g = max(0.0, soot_g + rate * dt_s / 3600.0)
+                if soot_g >= 40.0:
+                    regen_left = 1200.0
+                    regen_rows.append(i)
+        soot[i] = soot_g
 
     # --- events: maintenance happens with the engine stopped, i.e. at a session start --------
     idx = np.arange(n)
@@ -314,6 +337,22 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
     # --- other signals -----------------------------------------------------------------
     fuel = np.where(running, 2.0 + 0.00006 * rpm * (10 + load) * 3, 0.0)
     torque = np.where(running, load * 0.95, 0.0)
+    # charge air / turbo / exhaust / fuel system / crankcase / cooling system (toy relationships)
+    boost = np.where(running, 5.5 * np.clip(fuel - 2.0, 0, None), 0.0)
+    if scenario == "boost_leak":
+        boost = np.where(rel_h >= onset, boost * fp["boost_frac"], boost)
+    boost = np.clip(boost + np.where(running, rng.normal(0, 3, n), 0.0), 0, None)
+    turbo = np.where(running, 25000 + 420 * boost + rng.normal(0, 800, n), 0.0)
+    imt = amb + np.where(running, 12 + 0.12 * boost, 0.0) + rng.normal(0, 1, n)
+    exh = np.where(running, oil_t + 140 + 3.2 * load, oil_t) + rng.normal(0, 5, n)
+    fuel_p = np.where(running, 560 - 2.2 * fuel, 0.0) + rng.normal(0, 6, n)
+    crank_p = np.where(running, 0.25 + 0.006 * load + 0.0008 * rel_h, 0.0) + rng.normal(0, 0.05, n)
+    cool_p = np.where(running, 20 + 0.9 * np.clip(coolant - 20, 0, None), 0.5 * np.clip(coolant - 20, 0, None))
+    cool_p = np.clip(cool_p + rng.normal(0, 2, n), 0, None)
+    cool_lvl = 95.0 - 0.003 * rel_h + rng.normal(0, 0.3, n)
+    flow_f = 0.3 + 0.7 * np.clip(fuel / 40.0, 0, 1.2)
+    dpf = np.where(running, (0.8 + 0.12 * soot) * flow_f, 0.0) + rng.normal(0, 0.15, n)
+    ash = 5.0 + 0.01 * rel_h
     cranking = (rpm > 0) & ~running
     batt = np.where(running, 14.1, np.where(cranking, 10.3, 12.6)) + rng.normal(0, 0.08, n)
     oil_level = 80.0 - oil_consumption_pct_per_h * oil_age + rng.normal(0, 0.3, n)
@@ -333,6 +372,16 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
         "fuel_rate_lph": _quantize(table, "fuel_rate_lph", fuel),
         "ambient_temp_c": _quantize(table, "ambient_temp_c", amb),
         "engine_hours_h": _quantize(table, "engine_hours_h", hours_abs),
+        "boost_kpa": _quantize(table, "boost_kpa", boost),
+        "turbo_speed_rpm": _quantize(table, "turbo_speed_rpm", turbo),
+        "intake_manifold_temp_c": _quantize(table, "intake_manifold_temp_c", imt),
+        "exhaust_temp_c": _quantize(table, "exhaust_temp_c", exh),
+        "fuel_delivery_pressure_kpa": _quantize(table, "fuel_delivery_pressure_kpa", fuel_p),
+        "crankcase_pressure_kpa": _quantize(table, "crankcase_pressure_kpa", crank_p),
+        "coolant_pressure_kpa": _quantize(table, "coolant_pressure_kpa", cool_p),
+        "coolant_level_pct": _quantize(table, "coolant_level_pct", cool_lvl),
+        "dpf_dp_kpa": _quantize(table, "dpf_dp_kpa", np.clip(dpf, 0, None)),
+        "dpf_ash_load_pct": _quantize(table, "dpf_ash_load_pct", ash),
         "dm1_active_count": 0.0, "dm1_mil": 0.0, "dm1_rsl": 0.0, "dm1_awl": 0.0, "dm1_pl": 0.0,
     })
     # missing data: drop random oil-pressure samples (lost frames)
@@ -344,9 +393,10 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
           "detail": d} for e, i, d in events],
         columns=["engine_id", "t", "engine_hours", "event_type", "detail"])
     truth = {"scenario": scenario, "kind": {"sensor_drift": "sensor", "high_idle": "usage",
-                                            "cold_operation": "usage", "abusive": "usage",
+                                            "cold_operation": "usage", "abusive": "usage", "boost_leak": "engine",
                                             "healthy": "none"}.get(scenario, "engine"),
              "oil_change_engine_hours": [float(hours_abs[i]) for i in change_idx],
+             "regen_engine_hours": [float(hours_abs[i]) for i in regen_rows],
              "onset_engine_hours": prof.start_hours + onset if np.isfinite(onset) else None,
              "fault_params": fp, "noise_model": prof.noise_model, "start_hours": prof.start_hours}
     return SyntheticEngine(engine_id, scenario, df, ev, truth, prof)

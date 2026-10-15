@@ -12,6 +12,7 @@ from .baseline import Prepared, SignalBaseline, learn_signal, prepare
 from .config import load_defaults
 from .detection import drift_events, episode_rows, find_runs, merge_runs, operating_point
 from .engine_config import EngineConfig
+from .feedback import FeedbackStore, alert_id, apply_feedback, pattern_key
 from .framing import HONEST_FRAMING
 from .sensor_check import assess
 from .spn_table import SpnTable, load_spn_table
@@ -31,6 +32,8 @@ class AnalysisResult:
     status: dict[str, dict]
     baselines: dict[tuple[str, str], SignalBaseline]
     prepared: dict[str, Prepared] = field(default_factory=dict)
+    suppressed: list = field(default_factory=list)       # (alert, why) silenced by user feedback
+    transitions: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     def alerts_frame(self) -> pd.DataFrame:
         return pd.DataFrame([a.to_dict() for a in self.alerts])
@@ -59,6 +62,8 @@ class AnalysisResult:
             lines.append(f"  {st['learning_announcement']}")
             for k, v in st["layer_a"].items():
                 lines.append(f"  layer (a) {k}: {v}")
+            for tr in st.get("transitions", []):
+                lines.append(f"  transition: {tr}")
             for n in st["notes"]:
                 lines.append(f"  note: {n}")
             for a in self.for_engine(eid):
@@ -71,8 +76,13 @@ class AnalysisResult:
                     lines.append(f"      confounder: {c}")
                 for i, step in enumerate(a.check_next, 1):
                     lines.append(f"      check {i}: {step}")
+                if a.feedback_note:
+                    lines.append(f"      feedback: {a.feedback_note}")
             if not self.for_engine(eid):
                 lines.append("  no alerts")
+            for a, why in self.suppressed:
+                if a.engine_id == eid:
+                    lines.append(f"  suppressed by feedback: {a.headline()} -- {why}")
         return "\n".join(lines)
 
 
@@ -133,6 +143,50 @@ def _finish(alert: Alert, prep: Prepared, sb: SignalBaseline | None, window: np.
     return alert
 
 
+_CP_MODE = {"oil_grade_change": "mul", "sensor_replacement": "add", "sensor_change": "add", "oil_change": "none"}
+_CP_WHY = {"oil_change": "fresh oil restores the reference (fresh-oil) state; within-interval oil ageing stays "
+                         "visible as drift and is allowed for by the drift threshold"}
+
+
+def _changepoints(events: pd.DataFrame | None, engine_id: str, signal: str) -> list[dict]:
+    """Maintenance events (logged, or detected in phase 3) as change-points for one engine and signal."""
+    if events is None or len(events) == 0:
+        return []
+    ev = events[events["engine_id"] == engine_id]
+    out = []
+    for _, e in ev.iterrows():
+        kind = e["event_type"]
+        mode = _CP_MODE.get(kind)
+        if mode is None:
+            continue
+        if mode == "add":
+            # a sensor replacement shifts only the signal that sensor measures (default: oil pressure)
+            target = e.get("signal") if "signal" in ev and isinstance(e.get("signal"), str) else "oil_pressure_kpa"
+            if target != signal:
+                continue
+        label = kind.replace("_", " ") + (" (detected, unlogged)" if "detected" in str(e.get("detail", "")) else "")
+        out.append({"hours": float(e["engine_hours"]), "kind": kind, "mode": mode, "label": label,
+                    "why": _CP_WHY.get(kind, "")})
+    return out
+
+
+def _season_transitions(prep: Prepared, params: dict) -> list[str]:
+    df = prep.df
+    if "ambient_temp_c" not in df or df["ambient_temp_c"].notna().sum() == 0:
+        return []
+    h = df["_hours"].to_numpy()
+    P = params["derived"]["period_h"]
+    per = np.floor((h - h.min()) / P)
+    med = pd.Series(df["ambient_temp_c"].to_numpy(dtype=float)).groupby(per).median()
+    out = []
+    for p, v in med.items():
+        if abs(v - med.iloc[0]) > params["changepoints"]["season_shift_c"]:
+            out.append(f"season shift: ambient median {v:.0f} C in {h.min() + p * P:.0f}-{h.min() + (p + 1) * P:.0f} h "
+                       f"vs {med.iloc[0]:.0f} C at the start; learned bins include oil temperature, so no "
+                       f"re-baseline (listed as a confounder on alerts in that period)")
+    return out
+
+
 def _layer_a(prep: Prepared, cfg: EngineConfig | None, params: dict) -> tuple[list[tuple], dict]:
     ap = params["alerts"]
     df = prep.df
@@ -169,7 +223,8 @@ def _layer_a(prep: Prepared, cfg: EngineConfig | None, params: dict) -> tuple[li
 
 def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | None = None, *,
             dtc_episodes: pd.DataFrame | None = None, events: pd.DataFrame | None = None,
-            params: dict | None = None, table: SpnTable | None = None) -> AnalysisResult:
+            params: dict | None = None, table: SpnTable | None = None,
+            feedback: FeedbackStore | None = None) -> AnalysisResult:
     params = params or load_defaults()
     table = table or load_spn_table()
     engine_configs = engine_configs or {}
@@ -178,6 +233,8 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
     status: dict[str, dict] = {}
     baselines: dict[tuple[str, str], SignalBaseline] = {}
     prepared: dict[str, Prepared] = {}
+    suppressed: list = []
+    transitions: list[dict] = []
 
     for engine_id, df_e in canonical.groupby("engine_id", sort=True):
         cfg = engine_configs.get(str(engine_id))
@@ -188,7 +245,8 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
         hours = df["_hours"].to_numpy()
         st = {"hours_observed": (float(hours.min()), float(hours.max())), "hours_source": prep.hours_source,
               "row_interval_s": prep.dt_s, "config": cfg.path if cfg and cfg.path else ("in-memory" if cfg else "none"),
-              "notes": list(prep.notes), "learned": {}}
+              "notes": list(prep.notes), "learned": {}, "transitions": _season_transitions(prep, params)}
+        n_alerts_before = len(alerts)
 
         # ---- learned layers (b)-(d): per signal, from this engine's own rows only
         learn_ref = np.zeros(n, bool)
@@ -197,8 +255,11 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
                 st["learned"][signal] = {"status": "no_data", "message": f"{signal} not broadcast"}
                 continue
             res = table.by_canonical[signal].scale if signal in table.by_canonical else 1.0
-            sb = learn_signal(prep, signal, params, res)
+            sb = learn_signal(prep, signal, params, res, _changepoints(events, prep.engine_id, signal))
             baselines[(prep.engine_id, signal)] = sb
+            for adj in sb.adjustments:
+                st["transitions"].append(f"{signal}: {adj['label']} at {adj['hours']:.1f} h - {adj['note']}")
+                transitions.append({"engine_id": prep.engine_id, "signal": signal, **adj})
             st["learned"][signal] = {"status": sb.status, "message": sb.message, "trusted_bins": sb.trusted_bins,
                                      "capped_bins": len(sb.capped),
                                      "late_learned_bins": int(sb.reference["late_learned"].sum())
@@ -210,15 +271,20 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
                 continue
             ref_w = (hours >= sb.learn_start_h) & (hours < sb.learn_end_h)
 
-            # layer (c)
+            # layer (c); a pattern the user CONFIRMED is followed at a lower threshold
             z = sb.z
-            for direction, flag in (("low", z <= -ap["z_alert"]), ("high", z >= ap["z_alert"])):
+            fbf = params["feedback"]["confirmed_threshold_factor"]
+            zc = {d: ap["z_alert"] * (fbf if feedback and feedback.confirmed(prep.engine_id, "c", signal, d) else 1.0)
+                  for d in ("low", "high")}
+            for direction, flag in (("low", z <= -zc["low"]), ("high", z >= zc["high"])):
                 flag = np.nan_to_num(flag, nan=False).astype(bool)
                 runs = find_runs(flag, prep, ap["sustained_run_s"])
                 for ep in merge_runs(runs, prep, ap["merge_gap_engine_h"]):
                     rows = episode_rows(ep, n) & flag
                     zmed = float(np.median(z[rows]))
                     op = operating_point(prep, rows, params)
+                    zr = z[rows]
+                    op["z_recent"] = float(np.median(zr[-max(1, zr.size // 5):]))  # most recent 20 % of the episode
                     a = Alert(prep.engine_id, "c", signal, direction,
                               "warning" if abs(zmed) >= ap["z_severe"] else "watch",
                               df["t"].iloc[ep[0].i0], df["t"].iloc[ep[-1].i1], float(hours[ep[0].i0]),
@@ -231,7 +297,10 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
 
             # layer (d)
             tr = sb.trend
-            for ev in drift_events(sb, params):
+            dfac = fbf if feedback and (feedback.confirmed(prep.engine_id, "d", signal, "low")
+                                        or feedback.confirmed(prep.engine_id, "d", signal, "high")) else 1.0
+            oil_changes = [c["hours"] for c in _changepoints(events, prep.engine_id, signal) if c["kind"] == "oil_change"]
+            for ev in drift_events(sb, params, dfac):
                 first, last = tr.iloc[ev.first_idx], tr.iloc[ev.last_idx]
                 window = (hours > float(last["hours"]) - ap["trend_window_h"]) & (hours <= float(last["hours"]))
                 elig_w = window & df["_judgeable"].to_numpy() & np.isin(df["_bin"].to_numpy(),
@@ -255,6 +324,17 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
                 if last["capped_frac"] > 0:
                     fin.explanation += (f" The online baseline hit its drift cap in {last['capped_frac'] * 100:.0f} % "
                                         f"of bins: the slow change was flagged, not absorbed.")
+                # did the drift reset at an oil change right after the alert's last point? -> oil ageing
+                after_oc = [h for h in oil_changes if float(last["hours"]) < h <= float(last["hours"])
+                            + 3 * params["baseline"]["block_h"]]
+                if after_oc and ev.direction == "low":
+                    post = tr[tr["hours"] > after_oc[0]]["drift_rel"].head(2)
+                    thr = ap["drift_alert_rel"] * params["changepoints"]["oil_reset_frac"]
+                    if len(post) and float(post.median()) > -thr:
+                        fin.explanation += (f" The drift RESET at the oil change at {after_oc[0]:.1f} h (now "
+                                            f"{float(post.median()) * 100:+.1f} %): consistent with oil ageing rather "
+                                            f"than wear; it should not recur early in the new oil interval.")
+                        fin.confounders.append(f"oil change at {after_oc[0]:.1f} h reset the drift (oil ageing)")
                 alerts.append(fin)
 
         # ---- layer (a)
@@ -284,9 +364,19 @@ def analyze(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | N
                 if msgs else "no learnable signals"
         st["dm1_guard"] = "active" if prep.dm1_known else "unavailable (DM1 not broadcast)"
         status[prep.engine_id] = st
+        # ---- ids + user feedback (confirm / dismiss) for this engine's alerts
+        mine = alerts[n_alerts_before:]
+        for a in mine:
+            a.pattern_key = pattern_key(a)
+            a.alert_id = alert_id(a)
+        spn_of = {s: table.by_canonical[s].spn for s in params["baseline"]["signals"] if s in table.by_canonical}
+        kept, supp = apply_feedback(mine, feedback, params, dtc_episodes, spn_of)
+        del alerts[n_alerts_before:]
+        alerts.extend(kept)
+        suppressed.extend(supp)
 
     alerts.sort(key=lambda a: (a.engine_id, str(a.start_t), a.layer))
-    return AnalysisResult(alerts, status, baselines, prepared)
+    return AnalysisResult(alerts, status, baselines, prepared, suppressed, pd.DataFrame(transitions))
 
 
 __all__ = ["analyze", "AnalysisResult", "fmt_value"]

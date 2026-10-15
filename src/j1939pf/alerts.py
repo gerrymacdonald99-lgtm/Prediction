@@ -52,6 +52,9 @@ class Alert:
     sensor_evidence: list[str] = field(default_factory=list)
     confounders: list[str] = field(default_factory=list)
     data_window: dict = field(default_factory=dict)  # where to find the rows behind the alert
+    alert_id: str = ""
+    pattern_key: str = ""
+    feedback_note: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)

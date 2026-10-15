@@ -93,14 +93,14 @@ class DriftEvent:
     n_points: int
 
 
-def drift_events(sb: SignalBaseline, params: dict) -> list[DriftEvent]:
+def drift_events(sb: SignalBaseline, params: dict, threshold_factor: float = 1.0) -> list[DriftEvent]:
     ap = params["alerts"]
     tr = sb.trend
     if tr is None or len(tr) < ap["trend_min_points"]:
         return []
     h = tr["hours"].to_numpy()
     d = tr["drift_rel"].to_numpy()
-    thr = ap["drift_alert_rel"]
+    thr = ap["drift_alert_rel"] * threshold_factor
     events: dict[str, DriftEvent] = {}
     for i in range(len(tr)):
         w = (h > h[i] - ap["trend_window_h"]) & (np.arange(len(tr)) <= i)

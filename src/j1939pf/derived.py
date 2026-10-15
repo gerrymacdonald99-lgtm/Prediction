@@ -315,4 +315,54 @@ def derived_metrics(prep: Prepared, cfg: EngineConfig | None, params: dict,
     else:
         out["fan_on"] = unavailable("fan speed (SPN 975, OEM-specific) not broadcast")
     out["derate"] = unavailable("no verified derate-status SPN in the SPN table")
+    out["dpf_regens"] = regen_metric(prep, params)
     return out
+
+
+def detect_regens(prep: Prepared, params: dict) -> tuple[np.ndarray | None, str]:
+    """Infer active DPF regenerations from DPF differential pressure (no verified regen-status SPN).
+
+    Soot index = DPF dp / fuel rate (fuel rate as an exhaust-flow proxy) on running rows at high flow (fuel rate
+    >= `regen_min_flow_frac` x this engine's 95th percentile), where dp is well above its resolution. A regeneration is a drop of the index's 30-min median to below `regen_drop_frac` x the highest of
+    the previous `regen_lookback` windows; detections closer than `regen_min_gap_h` engine hours are merged.
+    Returns engine hours of inferred regenerations.
+    """
+    dp = params["derived"]
+    df = prep.df
+    if "dpf_dp_kpa" not in df or df["dpf_dp_kpa"].notna().sum() == 0:
+        return None, "DPF differential pressure (SPN 3251, OEM-specific) not broadcast"
+    if "fuel_rate_lph" not in df or df["fuel_rate_lph"].notna().sum() == 0:
+        return None, "fuel rate (SPN 183) not broadcast: no exhaust-flow proxy"
+    fuel = df["fuel_rate_lph"].to_numpy(dtype=float)
+    d = df["dpf_dp_kpa"].to_numpy(dtype=float)
+    run = df["_judgeable"].to_numpy() & np.isfinite(fuel) & np.isfinite(d)
+    if run.sum() < 200:
+        return None, "too few running rows"
+    m = run & (fuel >= dp["regen_min_flow_frac"] * np.nanpercentile(fuel[run], 95))  # high exhaust flow only
+    h = df["_hours"].to_numpy()[m]
+    idx = d[m] / fuel[m]
+    w = np.floor(h / 0.5)
+    g = pd.DataFrame({"w": w, "h": h, "i": idx}).groupby("w").agg(h=("h", "median"), i=("i", "median"), n=("i", "size"))
+    g = g[g["n"] >= 5]
+    out, last = [], -np.inf
+    vals, hs = g["i"].to_numpy(), g["h"].to_numpy()
+    k = dp["regen_lookback"]
+    for j in range(k, len(g) - 1):
+        prev = vals[j - k:j].max()
+        thr = dp["regen_drop_frac"] * prev
+        # the drop must persist into the next window (a burnt-off filter stays clean; noise does not)
+        if vals[j] < thr and vals[j + 1] < thr and hs[j] - last >= dp["regen_min_gap_h"]:
+            out.append(hs[j])
+            last = hs[j]
+    return np.asarray(out), ""
+
+
+def regen_metric(prep: Prepared, params: dict) -> dict:
+    hrs, why = detect_regens(prep, params)
+    if hrs is None:
+        return unavailable(why)
+    run_h = prep.df["_running"].sum() * prep.dt_s / 3600.0
+    return {"available": True, "inferred_regens": int(hrs.size),
+            "per_100_running_h": 100.0 * hrs.size / run_h if run_h else None,
+            "regen_hours": [round(float(x), 2) for x in hrs],
+            "note": "INFERRED from DPF dp drops (no verified regen-status SPN); missed or extra detections possible"}

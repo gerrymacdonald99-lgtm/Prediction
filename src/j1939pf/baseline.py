@@ -167,10 +167,16 @@ class SignalBaseline:
     z: np.ndarray | None = None
     expected: np.ndarray | None = None
     trend: pd.DataFrame | None = None
+    adjustments: list = field(default_factory=list)   # re-baselining at change-points
+    transition_rows: np.ndarray | None = None          # rows not judged while a step is being measured
 
     @property
     def trusted_bins(self) -> int:
         return 0 if self.reference is None else int(self.reference["trusted"].sum())
+
+
+def _fmt_step(mode: str, step: float) -> str:
+    return f"{step * 100:+.1f} %" if mode == "mul" else f"{step:+.1f} kPa"
 
 
 def eligible_mask(prep: Prepared, signal: str) -> np.ndarray:
@@ -182,8 +188,11 @@ def eligible_mask(prep: Prepared, signal: str) -> np.ndarray:
     return m
 
 
-def learn_signal(prep: Prepared, signal: str, params: dict, resolution: float) -> SignalBaseline:
+def learn_signal(prep: Prepared, signal: str, params: dict, resolution: float,
+                 changepoints: list[dict] | None = None) -> SignalBaseline:
+    """changepoints: [{hours, kind, mode: 'mul'|'add'|'none', label}] for THIS engine and signal."""
     bp = params["baseline"]
+    changepoints = sorted(changepoints or [], key=lambda c: c["hours"])
     df = prep.df
     hours = df["_hours"].to_numpy()
     vals = df[signal].to_numpy(dtype=float)
@@ -195,6 +204,15 @@ def learn_signal(prep: Prepared, signal: str, params: dict, resolution: float) -
         return sb
     h0 = float(hours[elig].min())
     L = float(bp["learning_period_h"])
+    # a grade change / sensor replacement inside the learning window would mix two states into one reference:
+    # learning restarts after it
+    restarted = None
+    for cp in changepoints:
+        if cp["mode"] != "none" and h0 < cp["hours"] < h0 + L:
+            h0, restarted = float(cp["hours"]), cp
+    if restarted is not None:
+        later = elig & (hours >= h0)
+        h0 = float(hours[later].min()) if later.any() else h0
     sb.learn_start_h, sb.learn_end_h = h0, h0 + L
     # eligible engine hours actually observed
     sb.hours_eligible = float(elig.sum() * prep.dt_s / 3600.0)
@@ -226,19 +244,53 @@ def learn_signal(prep: Prepared, signal: str, params: dict, resolution: float) -
     sb.status = "active"
     sb.message = (f"learning complete: reference window {h0:.1f}-{h0 + L:.1f} engine h, "
                   f"{int(ref['trusted'].sum())} trusted bins")
-    _run_online(sb, prep, signal, params, elig, hours, vals, keys)
+    if restarted is not None:
+        sb.message += f" (learning restarted after {restarted['label']} at {restarted['hours']:.1f} h)"
+    _run_online(sb, prep, signal, params, elig, hours, vals, keys,
+                [c for c in changepoints if c["hours"] >= h0 + L])
     return sb
 
 
-def _run_online(sb: SignalBaseline, prep: Prepared, signal: str, params: dict, elig, hours, vals, keys) -> None:
+def _measure_step(mode, elig, hours, vals, keys, h, pre_h, post_h, bins, min_n):
+    """Per-bin step across a change-point: weighted median of post/pre - 1 (mul) or post - pre (add)."""
+    pre = elig & (hours >= h - pre_h) & (hours < h)
+    post = elig & (hours >= h) & (hours < h + post_h)
+    a = pd.DataFrame({"k": keys[pre], "v": vals[pre]}).groupby("k")["v"].agg(["mean", "size"])
+    b = pd.DataFrame({"k": keys[post], "v": vals[post]}).groupby("k")["v"].agg(["mean", "size"])
+    common = a.index[a["size"] >= min_n].intersection(b.index[b["size"] >= min_n]).intersection(bins)
+    if len(common) == 0:
+        return np.nan, 0
+    ma, mb = a.loc[common, "mean"].to_numpy(), b.loc[common, "mean"].to_numpy()
+    w = np.minimum(a.loc[common, "size"].to_numpy(), b.loc[common, "size"].to_numpy()).astype(float)
+    d = (mb / ma - 1) if mode == "mul" else (mb - ma)
+    return _weighted_median(d, w), int(len(common))
+
+
+def _run_online(sb: SignalBaseline, prep: Prepared, signal: str, params: dict, elig, hours, vals, keys,
+                changepoints: list[dict] | None = None) -> None:
     bp = params["baseline"]
+    cpp = params["changepoints"]
     df = prep.df
+    # rows inside a re-baselining transition are neither judged nor learned from
+    pending = [dict(c) for c in (changepoints or []) if c["mode"] in ("mul", "add")]
+    tw = np.zeros(len(df), bool)
+    for c in pending:
+        c["until"] = c["hours"] + cpp["relearn_h"]
+        tw |= (hours >= c["hours"]) & (hours < c["until"])
+    elig_measure = elig            # the step itself is measured on the transition rows
+    elig = elig & ~tw
+    sb.transition_rows = tw
+    for c in changepoints or []:
+        if c["mode"] == "none":
+            sb.adjustments.append({"hours": c["hours"], "kind": c["kind"], "label": c["label"], "mode": "none",
+                                   "accepted": None, "step": None, "n_bins": None,
+                                   "note": "no re-baseline: " + c.get("why", "")})
     ref = sb.reference
     trusted = ref[ref["trusted"]]
     online = trusted["median"].copy()
     spread = trusted["spread"].copy()
     ref_med = trusted["median"].copy()
-    judge = df["_judgeable"].to_numpy() & ~np.isnan(vals) & (keys >= 0)
+    judge = df["_judgeable"].to_numpy() & ~np.isnan(vals) & (keys >= 0) & ~tw
     z = np.full(len(df), np.nan)
     expected = np.full(len(df), np.nan)
     learn_end = sb.learn_end_h
@@ -248,15 +300,54 @@ def _run_online(sb: SignalBaseline, prep: Prepared, signal: str, params: dict, e
     late: dict[int, list] = {}
     trend_rows = []
     last_drift = 0.0
-    for b in np.unique(block[block >= 0]):
-        rows = block == b
-        # layer (c): judge against the online baseline as it stood BEFORE this block
-        jr = np.flatnonzero(rows & judge & np.isin(keys, online.index.to_numpy()))
+    def apply(c):
+        step, nb = _measure_step(c["mode"], elig_measure, hours, vals, keys, c["hours"], cpp["pre_window_h"],
+                                 c["until"] - c["hours"], online.index, cpp["min_bin_samples"])
+        rec = {"hours": c["hours"], "kind": c["kind"], "label": c["label"], "mode": c["mode"], "step": step,
+               "n_bins": nb, "accepted": False}
+        limit = cpp["max_step_rel"] if c["mode"] == "mul" else cpp["max_step_add_kpa"]
+        if nb < cpp["min_bins"] or not np.isfinite(step):
+            rec["note"] = (f"NOT re-baselined: only {nb} comparable operating bins around the {c['label']}; "
+                           f"judging continues against the previous baseline")
+        elif abs(step) > limit:
+            rec["note"] = (f"NOT re-baselined: step {_fmt_step(c['mode'], step)} is larger than a {c['label']} can "
+                           f"explain (limit {_fmt_step(c['mode'], limit)}); the change stays visible to the alerts")
+        else:
+            rec["accepted"] = True
+            if c["mode"] == "mul":
+                online.loc[:] = online * (1 + step)
+                ref_med.loc[:] = ref_med * (1 + step)
+                spread.loc[:] = spread * (1 + step)
+            else:
+                online.loc[:] = online + step
+                ref_med.loc[:] = ref_med + step
+            late.clear()
+            rec["note"] = (f"re-baselined: step {_fmt_step(c['mode'], step)} measured over {nb} operating bins "
+                           f"({cpp['pre_window_h']:g} h before vs {c['until'] - c['hours']:g} h after); alerts were "
+                           f"not raised while it was measured")
+        sb.adjustments.append(rec)
+
+    def judge_rows(mask):
+        jr = np.flatnonzero(mask & judge & np.isin(keys, online.index.to_numpy()))
         if jr.size:
             k = keys[jr]
             e = online.reindex(k).to_numpy()
             expected[jr] = e
             z[jr] = (vals[jr] - e) / spread.reindex(k).to_numpy()
+
+    for b in np.unique(block[block >= 0]):
+        rows = block == b
+        bend = learn_end + (b + 1) * bp["block_h"]
+        # layer (c): judge against the online baseline as it stood BEFORE this block; a re-baselining step whose
+        # measurement window ends inside the block is applied exactly at that point (causal: it only uses rows
+        # before it)
+        done_upto = -np.inf
+        for c in sorted([c for c in pending if not c.get("done") and c["until"] < bend], key=lambda c: c["until"]):
+            judge_rows(rows & (hours >= done_upto) & (hours < c["until"]))
+            apply(c)
+            c["done"] = True
+            done_upto = c["until"]
+        judge_rows(rows & (hours >= done_upto))
         eb = rows & elig
         if not eb.any():
             continue
@@ -304,6 +395,15 @@ def _run_online(sb: SignalBaseline, prep: Prepared, signal: str, params: dict, e
                 ref.loc[k] = {"median": m, "spread": s, "n": len(arr), "sessions": len(segs), "trusted": True,
                               "late_learned": True}
                 online.loc[k], spread.loc[k], ref_med.loc[k] = m, s, m
+    for c in [c for c in pending if not c.get("done")]:
+        if hours.max() >= c["until"]:
+            apply(c)
+        else:
+            sb.adjustments.append({"hours": c["hours"], "kind": c["kind"], "label": c["label"], "mode": c["mode"],
+                                   "step": None, "n_bins": None, "accepted": None,
+                                   "note": f"TRANSITION IN PROGRESS: measuring the step after the {c['label']} "
+                                           f"until {c['until']:.1f} h; not judged meanwhile"})
+    sb.adjustments.sort(key=lambda a: a["hours"])
     sb.online = online
     sb.z = z
     sb.expected = expected

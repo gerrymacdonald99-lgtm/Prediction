@@ -17,16 +17,16 @@ and which way it is trending". Nothing stronger.
 
 ## Build status
 
-The program is built in five phases. **Phases 1–3 are implemented.** Later-phase modules
-(correlations, change-point re-baselining, feedback loop, anomaly/survival models, HTML
-reports, CLI) do not exist yet. There are no stubs for them.
+The program is built in five phases. **Phases 1–4 are implemented.** Phase 5 modules
+(anomaly detection, supervised/survival models, health score, HTML reports, CLI) do not
+exist yet. There are no stubs for them.
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Parser, TP reassembly, SPN decode, canonical series | done |
 | 2 | Synthetic generator, baseline layers (a)–(d), core alerts | done |
 | 3 | Derived values, exposure reports, oil-change tracking | done |
-| 4 | Correlations, change-points, feedback loop | not started |
+| 4 | Correlations, change-points, feedback loop | done |
 | 5 | Anomaly detection, supervised/survival, reporting, CLI | not started |
 
 ## Install and test
@@ -345,6 +345,106 @@ The synthetic generator now also models oil ageing (viscosity loss, oil consumpt
 loading), maintenance at session starts, cranking with voltage sag, and an `abusive`
 scenario: lugging, high load from a cold start, and no cool-down before shutdown.
 
+## Phase 4: change-points, feedback loop, correlations
+
+```python
+from j1939pf.feedback import FeedbackStore
+from j1939pf.correlation import correlation_report
+
+store = FeedbackStore("feedback.json")             # local, append-only decision log
+rep = usage_report(parsed.canonical, configs, events=log_df)  # passes logged + detected events on
+r = analyze(parsed.canonical, configs, events=rep.events_used, feedback=store)
+store.dismiss(r.alerts[0], "gauge reads the same; known weak pump, replacement booked")
+store.confirm(r.alerts[1], "bearing wear confirmed at teardown")
+r.transitions                                       # re-baselining record per change-point
+r.suppressed                                        # alerts silenced by a dismissal (with the reason)
+corr = correlation_report(r, configs, events=rep.events_used)
+print(corr.summary_text()); corr.flags()            # {"SA00": ["RELATIONSHIP BROKE: boost_vs_fuel_rate ..."]}
+```
+
+### Change-points: re-baselining, not alert floods
+
+Change-points come from the maintenance log, plus the oil and sensor changes detected in
+Phase 3.
+
+| Event | Handling |
+|---|---|
+| Oil-grade change | **Multiplicative re-baseline** of oil pressure and filter dp, since viscosity scales both. |
+| Sensor replacement (logged, or detected by the engine-off zero shift) | **Additive re-baseline** of that sensor's signal (default: oil pressure). |
+| Oil change | No re-baseline: fresh oil restores the reference state. It is recorded as a transition. A low drift that **resets** at an oil change is annotated "consistent with oil ageing rather than wear". |
+| Season | Reported as a transition when the ambient median moves more than 10 °C. Bins already hold oil temperature constant. |
+
+How a re-baseline works:
+
+* For `relearn_h` (10 engine h) after the event, that signal is **not judged**. This is a
+  flagged transition.
+* The step is then measured per operating bin: 10 h before vs 10 h after, weighted median.
+* It is applied causally, at the exact end of the transition.
+* The step is **measured locally**, not against the original reference. Wear that had
+  already accumulated is therefore kept, not absorbed (tested: bearing wear still alerts
+  across a grade change).
+* A step larger than the event can explain (> 15 % for a grade change, > 30 kPa for a
+  sensor) is **refused**. The change stays visible to the alerts.
+* A change-point inside the learning window restarts learning.
+* Tested: a ±12 kPa sensor replacement and a −10 %/+8 % grade change, each on top of 100 h
+  oil changes, give **zero alerts**. The measured steps come within 2.5 kPa / 1.5 % of the
+  truth.
+
+### Feedback loop
+
+`FeedbackStore` saves confirm/dismiss decisions to a local JSON file. Records are
+append-only, and a reason is required.
+
+* Each alert has a stable `pattern_key`: engine | layer | signal | direction | where (the
+  RPM band, the limit name, or "engine").
+* **Dismissed:** the pattern is suppressed on later runs and listed in `suppressed` with the
+  reason. It comes back only on **new evidence**:
+  * the deviation grows to at least 1.5× its size when dismissed (for layer c, the larger of
+    the episode median |z| and the most recent 20 %), or
+  * a DM1 code for the SPN appears after the dismissal.
+  The re-raised alert says why it returned.
+* **Confirmed:** the pattern is escalated one severity level, cites the confirmation, and is
+  detected at 0.75× the normal z / drift threshold, so it is followed earlier.
+
+### Correlation discovery
+
+Each relationship reports:
+
+* Spearman rho with a 95 % CI (bootstrap over sessions, seeded);
+* n rows **and** n independent units (sessions, blocks, periods or engines);
+* the valid operating range and condition;
+* the confounders;
+* a status.
+
+| Kind | Relationships |
+|---|---|
+| Curve (learned on the reference window, re-checked every 25 h) | oil pressure vs RPM (oil temperature held ±5 °C), coolant temperature vs load, boost vs fuel rate, fuel pressure vs fuel rate, turbo speed vs boost, coolant pressure vs coolant temperature, DPF dp vs fuel rate |
+| Trend vs engine hours | oil-pressure drift, crankcase pressure, oil level, coolant level, DPF ash |
+| Per period / across the fleet | idle % vs oil-pressure degradation, idle % vs regen frequency, low-temp % vs wear trend |
+
+* **Break detection:** a curve is **BROKEN** when two consecutive periods sit at least 3
+  reference spreads off it, and the result is flagged (`RELATIONSHIP BROKE`). A break that
+  coincides with a known change-point is reported as "broken (explained)".
+  * Tested: a synthetic charge-air leak breaks boost vs fuel rate at its onset, while turbo
+    speed vs boost correctly stays stable.
+  * A grade change shows as an explained break.
+* Period and fleet relationships with fewer than 8 points are labelled **inconclusive**
+  rather than over-claimed.
+* **Regenerations are INFERRED** from DPF dp drops, since there is no verified regen-status
+  SPN. On synthetic data they match on normal duty, but idle-heavy duty is over-counted by
+  about 35 %.
+
+The generator now also produces:
+
+* boost and turbo speed;
+* intake manifold and exhaust temperature;
+* fuel delivery pressure;
+* crankcase pressure (slow blow-by growth);
+* coolant pressure and level;
+* DPF dp from a soot model with active regenerations;
+* ash load;
+* a `boost_leak` fault.
+
 ## Honest limitations
 
 * The SPN table is unverified (see above). A wrong byte position gives plausible-looking but
@@ -353,9 +453,11 @@ scenario: lugging, high load from a cold start, and no cool-down before shutdown
   They prove the plumbing (decoding, reassembly, resampling, equivalence, baselines, alerts)
   works. They say nothing about real-world accuracy. Thresholds were checked against several
   noise models and seeds so they are not tuned to one scenario, but real engines will differ.
-* Normal oil ageing makes healthy engines drift a few % between oil changes. Phase 3 detects
-  and tracks oil changes, but the learned baselines are not re-baselined at them until
-  Phase 4. Healthy test engines still produce zero alerts.
+* Normal oil ageing makes healthy engines drift a few % within each oil interval. The drift
+  threshold allows for it, and a low drift that resets at an oil change is annotated as oil
+  ageing. With very long oil intervals that margin is thinner.
+* Correlations are associations in one engine's own data, not causes. Fleet-level
+  relationships need many engines before they mean anything.
 * Without failure labels, alerts report deviation, exposure and trend. They never say a
   condition shortens life, and there is no life-loss formula anywhere.
 * CSV inputs carry no raw frames, so they have no TP/DM1 frame decoding. DM1 lamp and count

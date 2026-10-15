@@ -114,7 +114,7 @@ def merge_events(logged: pd.DataFrame | None, oil_results: dict[str, OilServiceR
 def usage_report(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig] | None = None, *,
                  dtc_episodes: pd.DataFrame | None = None, events: pd.DataFrame | None = None,
                  params: dict | None = None, table: SpnTable | None = None,
-                 analysis: AnalysisResult | None = None) -> UsageReport:
+                 analysis: AnalysisResult | None = None, feedback=None) -> UsageReport:
     params = params or load_defaults()
     table = table or load_spn_table()
     engine_configs = engine_configs or {}
@@ -130,7 +130,7 @@ def usage_report(canonical: pd.DataFrame, engine_configs: dict[str, EngineConfig
     merged = merge_events(events, oil)
     if analysis is None:
         analysis = analyze(canonical, engine_configs, dtc_episodes=dtc_episodes, events=merged, params=params,
-                           table=table)
+                           table=table, feedback=feedback)
 
     engines = {}
     for eid, prep in preps.items():

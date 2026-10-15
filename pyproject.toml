@@ -9,6 +9,9 @@ description = "Per-engine J1939 exposure, trend and early-warning analysis (no l
 requires-python = ">=3.11"
 dependencies = ["pandas>=2.0", "numpy>=1.24", "scipy>=1.10", "scikit-learn>=1.3", "PyYAML>=6.0"]
 
+[project.scripts]
+j1939pf = "j1939pf.cli:main"
+
 [project.optional-dependencies]
 survival = ["lifelines>=0.27"]
 test = ["pytest>=7"]

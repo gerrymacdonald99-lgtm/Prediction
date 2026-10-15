@@ -155,3 +155,35 @@ correlations:
     - {name: oil_level_vs_hours, y: oil_level_pct, condition: running, confounders: [top-ups and oil changes, level sensor]}
     - {name: coolant_level_vs_hours, y: coolant_level_pct, condition: running, confounders: [top-ups, temperature]}
     - {name: dpf_ash_vs_hours, y: dpf_ash_load_pct, condition: running, confounders: [OEM ash model, DPF service]}
+
+# ---------------------------------------------------------------------------
+# Phase 5. TUNABLE program defaults.
+anomaly:
+  features: [engine_speed_rpm, load, oil_pressure_kpa, oil_temp_c, coolant_temp_c, fuel_rate_lph, boost_kpa,
+             intake_manifold_temp_c, fuel_delivery_pressure_kpa, oil_filter_dp_kpa]
+  min_feature_coverage: 0.9      # a signal joins the feature set only if present in this share of running rows
+  min_rows: 500
+  max_fit_rows: 5000
+  reference_quantile: 0.995      # threshold = this quantile of the engine's own reference scores
+  iforest_trees: 200
+  rpm_bin: 100                   # joint models run on residuals from each signal's reference median per
+  load_bin: 10                   # RPM x load bin (operating point removed)
+  min_bin_rows: 20
+  period_h: 25
+
+labels:                          # supervised / survival layers: only with failure labels in the event log
+  failure_prefix: failure        # event_type "failure" or "failure_<component>"
+  horizon_h: 200                 # supervised: does a failure follow within this many engine hours?
+  period_h: 50
+  min_positive_periods: 10
+  min_failed_engines: 5
+  min_negative_periods: 20
+  min_survival_events: 10
+  bootstrap: 200
+
+health:                          # health score = weighted mean of component sub-scores (each 0-100)
+  weights: {oil_pressure_kpa: 3, oil_filter_dp_kpa: 1, oil_temp_c: 1, coolant_temp_c: 1, joint_anomaly: 1,
+            relationships: 1, faults: 1, data_quality: 0.5}
+  alert_subscore: {critical: 0, warning: 40, watch: 70}
+  anomaly_excess_zero: 0.10      # anomaly rate 10 points above 3x the reference rate -> sub-score 0
+  error_fraction_zero: 0.05      # 5 % error-coded samples -> data-quality sub-score 0

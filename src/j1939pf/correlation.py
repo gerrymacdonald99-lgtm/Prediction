@@ -394,3 +394,23 @@ def correlation_report(analysis, engine_configs=None, *, events: pd.DataFrame | 
             rels.append(Relationship("FLEET", name, "fleet", xa, ya, False,
                                      reason=f"needs at least 3 engines (have {len(fleet_rows)})", confounders=list(conf)))
     return CorrelationReport(rels)
+
+
+MATRIX_SIGNALS = ["engine_speed_rpm", "load", "oil_pressure_kpa", "oil_temp_c", "coolant_temp_c", "fuel_rate_lph",
+                  "boost_kpa", "turbo_speed_rpm", "intake_manifold_temp_c", "fuel_delivery_pressure_kpa",
+                  "oil_filter_dp_kpa", "crankcase_pressure_kpa", "coolant_pressure_kpa", "dpf_dp_kpa"]
+
+
+def correlation_matrix(prep: Prepared, ref_end_h: float, params: dict, signals=None) -> pd.DataFrame:
+    """Spearman correlation between signals on this engine's reference window (running rows)."""
+    df = prep.df
+    cols = []
+    for s in signals or MATRIX_SIGNALS:
+        c = prep.load_col if s == "load" else s
+        if c and c in df and df[c].notna().mean() > 0.5:
+            cols.append(c)
+    m = df["_judgeable"].to_numpy() & (df["_hours"].to_numpy() < ref_end_h)
+    sub = df.loc[m, cols]
+    if len(sub) > params["correlations"]["max_rows"]:
+        sub = sub.sample(params["correlations"]["max_rows"], random_state=params.get("seed", 0))
+    return sub.corr(method="spearman")

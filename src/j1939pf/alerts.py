@@ -56,6 +56,12 @@ class Alert:
     pattern_key: str = ""
     feedback_note: str = ""
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Alert":
+        import dataclasses
+        names = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["start_t"] = str(self.start_t)

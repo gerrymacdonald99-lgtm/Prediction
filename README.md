@@ -1,468 +1,430 @@
-# j1939pf: J1939 per-engine exposure and early-warning analysis
+# j1939pf: per-engine J1939 exposure, trend and early-warning analysis
 
-> **What this program can and cannot tell you.**
-> Without failure labels this program can only report **exposure** (time × severity of
-> deviation from this engine's own learned baseline) and **trend**. It cannot state that a
-> condition shortens engine life. Life-shortening claims come only from label-based layers
-> (supervised / survival), and those always show sample size and confidence.
+> **Read this first.**
+> Without failure labels this program can only report EXPOSURE (time x severity of deviation from this engine's own learned baseline) and TREND. It cannot state that a condition shortens engine life. Life-shortening claims are made only by label-based layers (supervised / survival) and always show sample size and confidence.
 >
-> It never converts low-oil-pressure exposure into "percent of life lost", and it never
-> invents engine spec numbers. Every limit comes from the per-engine config, written from
-> that engine's manual.
+> The program never turns low-oil-pressure exposure into "percent of life lost", and never
+> invents engine specifications. Every limit comes from the per-engine config written from
+> that engine's manual. If a limit is missing, the program says so and does not judge that
+> signal against it.
 
-The headline question is: *do certain oil pressures at certain RPMs (and related operating
-conditions) shorten engine life?* The honest answer this tool can give without failure
-history is "here is how much time this engine spent at each deviation from its own normal,
-and which way it is trending". Nothing stronger.
+The headline question is *"do certain oil pressures at certain RPMs, and related operating
+conditions, shorten engine life?"* Without failure history, the honest answer this program
+gives is: how much time this engine spent at each deviation from its **own** normal, and
+which way it is trending. Only when your event log contains enough failures do the
+label-based layers estimate effects on time to failure, and then always with n and
+confidence intervals.
 
-## Build status
+**Synthetic-data caveat.** Every test runs on self-built bus data with self-scripted faults.
+That proves the plumbing works: decoding, baselines, alerts, exposure, re-baselining,
+correlations and reports. It says **nothing** about real-world accuracy. Run the program on
+your own engines, check its alerts against inspections, and use the feedback loop.
 
-The program is built in five phases. **Phases 1–4 are implemented.** Phase 5 modules
-(anomaly detection, supervised/survival models, health score, HTML reports, CLI) do not
-exist yet. There are no stubs for them.
+---
 
-| Phase | Scope | Status |
-|---|---|---|
-| 1 | Parser, TP reassembly, SPN decode, canonical series | done |
-| 2 | Synthetic generator, baseline layers (a)–(d), core alerts | done |
-| 3 | Derived values, exposure reports, oil-change tracking | done |
-| 4 | Correlations, change-points, feedback loop | done |
-| 5 | Anomaly detection, supervised/survival, reporting, CLI | not started |
-
-## Install and test
+## 1. Install and test
 
 ```bash
-pip install -e '.[test]'      # Python 3.11+; pandas, numpy, scipy, scikit-learn, PyYAML
-pytest                        # lifelines is optional, needed only for phase 5 survival models
+pip install -e '.[test]'        # Python 3.11+: pandas, numpy, scipy, scikit-learn, PyYAML (+ pytest)
+pytest                          # 189 tests, about 11 minutes (synthetic engines are generated on the fly)
 ```
 
-The program makes no network calls.
+* **No network calls** at runtime.
+* All randomness is seeded through `seed` in `config/defaults.yaml` (default 0): the
+  generator, the isolation forest, and the bootstraps.
+* `lifelines` is **not required**. The survival layer uses its own scipy implementation (a
+  Weibull AFT model and Kaplan–Meier). `lifelines` could not be built in the development
+  environment (Python 3.13), so there is no lifelines code path to go untested.
 
-## Using Phase 1 on real logs
+## 2. Quick start with synthetic data
 
-```python
-from j1939pf.pipeline import canonical_from_candump, canonical_from_csv
-
-r = canonical_from_candump("logs/truck12.log")      # .log or .log.gz, streamed line by line
-r.canonical       # one row per engine per resample interval
-r.dtc_episodes    # DM1/DM2 SPN/FMI episodes (first seen, last seen, max occurrence count)
-r.report          # parse quality: malformed lines, duplicates, TP stats, per-signal status counts,
-                  # which source addresses sent which PGNs, late or dropped samples, unverified SPNs
-
-r = canonical_from_csv("logs/telematics.csv", "config/my_logger_mapping.yaml")
+```bash
+j1939pf generate --scenario stuck_relief_valve --hours 300 --seed 1 --out demo.csv --events-out demo_events.csv
+j1939pf analyze demo.csv --engines config/engines/TEMPLATE.yaml --events demo_events.csv --synthetic --out out/
+open out/report.html            # or read out/summary.txt
 ```
 
-### Inputs
+`TEMPLATE.yaml` has no limits, so layer (a) is disabled and the learned layers do all the
+work. Available scenarios: `healthy`, `bearing_wear`, `clogged_filter`,
+`stuck_relief_valve`, `failing_pump`, `sensor_drift`, `high_idle`, `cold_operation`,
+`abusive`, `boost_leak`. Outputs from `--synthetic` runs are labelled SYNTHETIC.
 
-* **candump text**: `candump -l` log format `(ts) can0 18FEEE00#...` or `candump -ta`
-  screen format `(ts) can0 18FEEE00 [8] 7D 7D ...`. Timestamps are required. Standard
-  (11-bit), remote and CAN-FD frames are counted and skipped.
-* **CSV from telematics loggers**: requires a column mapping. See
-  `config/csv_mapping.example.yaml`. Each mapped column names an SPN (or a canonical name)
-  and **must** state its unit (psi, degF, gal/h, …). Units are converted, never guessed.
-  Timestamp format and timezone are configured. Blank cells mean "no sample". Configured
-  `na_values` mean "not available" and `error_values` mean a sensor error.
-* Both paths emit the same internal sample stream and go through the same resampler, so
-  the **same bus data produces the same canonical series** (tested).
+## 3. Running on real logs
 
-### The SPN table (`config/spn_table.yaml`): verify it before trusting anything
-
-The decode table is data, not code. Each entry has PGN, SPN, name, start byte/bit, length,
-scale, offset, unit, valid range and not-available/error handling. **Every entry ships with
-`verified: false`.** The positions were transcribed from memory of J1939-71 and have not
-been checked against a licensed J1939DA. Check each signal you rely on, set
-`verified: true`, and note the source. Every parse report lists the unverified SPNs that
-were used.
-
-Places where this table departs from, or answers, the draft table:
-
-* **SPN 99 (oil filter Δp)**: the draft placed it in PGN 65263. My reading puts it in
-  PGN 65276 (Dash Display) byte 4. Verify.
-* **SPN 97 (water in fuel)**: placed in PGN 65279 byte 1, bits 1–2 (2-bit state). Verify.
-* **SPN 107 (air filter Δp)**: believed to be in IC1 (PGN 65270) byte 5. Verify.
-* **TSC1 (PGN 0)** is a command *to* the engine, so its values are attributed to the
-  destination address, not the sender.
-* OEM-specific signals (turbo speed, fan, DPF Δp, ash load, DEF level) are decoded only
-  where they are actually broadcast. Their positions are low-confidence. SCR temperatures,
-  NOx, EGR position, PTO and derate status are not in the table until a verified position
-  is available.
-
-### Decoding rules
-
-* 29-bit ID → priority, PGN, source address, destination address. PDU1 (PF < 240) carries
-  the DA in PS, which is not part of the PGN. PDU2 is broadcast.
-* **Not-available (0xFF…), error (0xFE…), reserved (0xFB–0xFD…) and out-of-range values
-  decode to NULL, never to a reading.** Bad readings (error, reserved, out of range, short
-  payload) are counted per interval in `<signal>__err` columns. That count feeds sensor-fault
-  versus engine-wear discrimination in later phases.
-* Oil pressure (SPN 100) is 4 kPa/bit, about 0.58 psi/bit. Later phases floor baseline
-  spread at this quantization.
-* **Transport protocol (TP.CM/TP.DT)**: BAM and RTS/CTS, with J1939-21 timeouts evaluated
-  on frame timestamps. A message is emitted only when every packet arrived. A lost BAM packet
-  drops the message. RTS/CTS retransmissions after a CTS are accepted. Exact duplicate packets
-  are ignored. A conflicting duplicate in a BAM aborts the message. Every outcome is counted
-  in `report["transport"]`.
-* **DM1** (single- or multi-frame): lamp states plus an SPN/FMI/OC list, using conversion
-  method 4. Messages with CM = 1 are counted, because their SPNs may be mis-decoded. DM2 goes
-  to the DTC episode list only.
-* **Multi-engine buses**: each source address is a separate engine (`SA00`, `SA01`, …)
-  unless `sources.engine_map` in the config maps it, for example mapping an aftertreatment
-  ECU's SA onto its engine. `report["decode"]["source_addresses"]` shows which SA sent which
-  PGNs, so you can write that mapping.
-
-### Canonical series
-
-One row per engine per `resample_interval_s` (default 1 s):
-
-* Fast signals (EEC1 at about 20 ms) are averaged within the interval. Counters (hours,
-  total fuel) take the last value.
-* Slow signals (ET1 at about 1 s) are held across empty intervals for at most
-  max(3 s, 3 × typical rate), then become NULL.
-* An interval whose only samples were error or not-available is NULL and never filled from
-  an earlier value.
-* Duplicate captures (same interface, ID and data within 0.5 ms) are dropped.
-* Silence longer than `gap_s` starts a new `segment`. No rows are produced in the gap and
-  nothing is held across it.
-* Samples more than `lateness_s` out of order (for example a logger clock stepping
-  backwards) are dropped and counted, not silently merged.
-* The whole pipeline streams: neither the file nor one object per frame is held in memory.
-  The test parses a 6 MB+ log under a quarter of its size in peak traced memory.
-
-`config/defaults.yaml` holds **tunable program defaults, not engine specifications**:
-interval, gap, hold, TP timeouts and DTC episode gap.
-
-## Phase 2: per-engine baselines and alerts
-
-```python
-from j1939pf.analysis import analyze
-from j1939pf.engine_config import load_engine_configs
-
-r = analyze(parsed.canonical, load_engine_configs("config/my_engines/"),
-            dtc_episodes=parsed.dtc_episodes, events=maintenance_log_df)
-print(r.summary_text())        # header always states the exposure-not-life-loss framing
-r.alerts_frame()               # one row per alert episode
-r.status["SA00"]               # learning period, layer availability, notes
-r.alert_data(r.alerts[0])      # the canonical rows (with expected value and z) behind an alert
+```bash
+j1939pf analyze truck12.log.gz --engines my_engines/ --events maintenance.csv --feedback feedback.json --out out/
+j1939pf analyze telematics.csv --csv-mapping my_logger.yaml --engines my_engines/ --out out/
+j1939pf parse truck12.log --out truck12_canonical.csv       # decode once, analyse the CSV many times
 ```
 
-### Writing the engine config from the manual
+* **candump:**
+  * Formats: `candump -l` (`(ts) can0 18FEEE00#...`) or `candump -ta` screen format; `.gz`
+    files are read directly.
+  * Timestamps are required.
+  * Logs are streamed line by line, never loaded whole.
+* **Telematics CSV:** copy `config/csv_mapping.example.yaml`.
+  * Every column names an SPN (or canonical name) **and its unit**. psi, °F, gal/h and so on
+    are converted, never guessed.
+  * Timestamp format and timezone are configurable.
+  * Blank cell = no sample; `na_values` = "not available"; `error_values` = a sensor error.
+  * The same bus data gives the same canonical series from candump and from CSV (tested).
+* **Several engines on one bus:**
+  * Each source address is its own engine (`SA00`, `SA01`, …).
+  * Map addresses in an override file passed with `--defaults`, for example
+    `sources: {engine_map: {0: port_main, 61: port_main}}`, which puts an aftertreatment ECU
+    on its engine.
+  * `parse_report.json` lists which SA sent which PGNs.
+* **Overrides:** `--defaults my_overrides.yaml` overrides any value in
+  `config/defaults.yaml`. Every value there is a tunable program default, **not** an engine
+  spec.
 
-Copy `config/engines/TEMPLATE.yaml`, one file per engine. Every limit takes
-`{value, unit, source}`, where `source` is the manual section or page. Units are converted
-(psi/kPa/bar, degF/degC). **No limit has a default.** If a limit is missing, layer (a) is
-disabled for that signal, and the status says so. The learned layers (b)–(d) still run.
+### The SPN decode table: verify it before trusting decoded values
 
-The `example_*_PLACEHOLDER.yaml` files hold the on-highway placeholder minimums only:
-Cummins ~15/35 psi, Caterpillar ~10–20/30–45 psi (lower bound used), Cummins ISB ~10/30 psi.
-The ~248 °F maximum oil temperature is marked UNVERIFIED. All of these are flagged
-`placeholder: true`, and every alert that uses one says so. There are no industrial
-(QSK/C32/MTU) values; take those from the manual. Rated RPM and the idle band are left empty
-in the examples on purpose.
+`config/spn_table.yaml` is data, not code. Every entry has PGN, SPN, start byte/bit, length,
+scale, offset, unit, valid range and not-available handling, and **every entry ships with
+`verified: false`**. The positions were transcribed from memory of J1939-71. Check each
+signal you rely on against your licensed J1939DA or the OEM's broadcast list, set
+`verified: true`, and record the source. Every report lists the unverified SPNs it used.
 
-### The four layers
+Places where the table departs from, or answers, the original draft (verify each):
 
-| Layer | What | Learned from |
-|---|---|---|
-| (a) | Manual thresholds: oil pressure minimum (at all running speeds), minimum at rated speed (within ±100 rpm of the configured rated RPM), max oil and coolant temperature | the engine config only |
-| (b) | Per-bin baseline: RPM (100 rpm) × oil temperature (5 °C) × load (25 %); median and robust spread | this engine's first 40 eligible engine hours |
-| (c) | z = (actual − expected) / spread, alert when \|z\| ≥ 4 for ≥ 120 s | (b) plus a capped online update |
-| (d) | Engine-level drift vs the fixed early-hours reference, with a Theil–Sen slope and 95 % CI | (b) |
+* SPN 99 (oil filter Δp): PGN 65276 (DD) byte 4, not 65263.
+* SPN 97 (water in fuel): PGN 65279, 2-bit state.
+* SPN 107 (air filter Δp): IC1 byte 5.
+* TSC1 is a command *to* the engine, so it is attributed to the destination address.
+* OEM-specific signals (turbo speed, fan, DPF Δp, ash, DEF) are low-confidence and decoded
+  only where broadcast.
+* SCR temperatures, NOx, EGR, PTO and derate status are not in the table yet.
 
-* **Eligible (learnable) rows**: engine running, past the 60 s startup grace, no active DM1
-  code, reading decoded OK (no error/not-available encoding). If DM1 is not broadcast, the
-  status says that learning is unguarded by fault codes.
-* **Trusted bin**: at least 30 samples from at least 3 separate sessions. The spread
-  includes session-to-session variation and is floored at the bus resolution (4 kPa for oil
-  pressure) and at 2.5 % of the bin median, so quantization cannot inflate z-scores.
-* **Online learning guardrails**: after the learning period a bin's expected value follows
-  new data slowly, and only when that block is not itself anomalous. It never moves more
-  than 3 % from the reference (the drift cap). Bins that hit the cap are counted, and the
-  drift alert says "flagged, not absorbed". New bins are learned after the learning period
-  only while the engine is near its reference.
-* **"Drift flagged before threshold"**, as tested: a layer (d) alert fires when the
-  engine-level drift against the fixed reference window passes −4 % and the slope's 95 % CI
-  excludes zero. The test asserts that this happens before any layer (a) alert, while the
-  engine's oil pressure (1st percentile, idle and rated) is still above the configured
-  minimums.
-* **New engines** announce `LEARNING PERIOD: x of 40 engine hours observed`. Until then only
-  layer (a) judges them. Baselines are per engine: nothing is copied between engines, and an
-  engine's model is identical whether it is analysed alone or with its fleet (tested).
-* Runs less than 10 engine hours apart merge into one alert episode, so a persistent fault
-  produces one alert rather than one per day.
-* All of these numbers are **tunable program defaults** in `config/defaults.yaml`. They are
-  not engine specs.
+## 4. Writing the engine config from the manual
 
-### Reading an alert
+Copy `config/engines/TEMPLATE.yaml`, one file per engine (`engine_id` = `SA00`… or your mapped
+name). Every limit is `{value, unit, source}`, where `source` is the manual section or page.
+**No limit has a default.**
 
-Each alert records the following:
+| Limit | Used by |
+|---|---|
+| `oil_pressure_min_idle`, `oil_pressure_min_rated`, `rated_rpm` | layer (a) oil-pressure thresholds (the rated minimum needs `rated_rpm`) |
+| `oil_temp_max`, `coolant_temp_max` | layer (a), over-temperature exposure |
+| `idle_rpm_band`, `idle_load_cutoff`, `load_signal` (SPN 92, falling back to 513) | idle %, extended idling |
+| `coolant_low_temp_cutoff`, `oil_low_temp_cutoff` | cold starts, time to temperature, low-temp running, cold-oil-high-RPM |
+| `idle_pct_flag_threshold` | the HIGH IDLE flag (fleet policy is a valid source) |
+| `lugging_rpm_max` | lugging exposure (manual: below peak-torque speed) |
+
+* A missing limit disables only what needs it. Each output says "unavailable: …missing from
+  engine config", and the learned layers still run.
+* The `example_*_PLACEHOLDER.yaml` files hold **on-highway placeholder** oil-pressure
+  minimums only:
+  * Cummins ~15 / 35 psi;
+  * Caterpillar ~10–20 / 30–45 psi (lower bound used);
+  * Cummins ISB ~10 / 30 psi;
+  * ~248 °F max oil temperature, marked **UNVERIFIED**.
+* All placeholders carry `placeholder: true`, and every alert that uses one says so.
+* There are **no industrial (QSK, C32, MTU) values**: take them from the manual.
+
+## 5. Maintenance / failure event log (optional; everything works with none)
+
+CSV with `engine_id, engine_hours, event_type` and optional `t, detail, signal`:
+
+| event_type | effect |
+|---|---|
+| `oil_change` | change-point; confirmed or not by its oil-pressure signature; resets "hours since oil change" |
+| `oil_grade_change` | multiplicative re-baseline of oil pressure and filter dp |
+| `sensor_replacement` | additive re-baseline of that sensor's signal (`signal` column; default oil pressure) |
+| `failure` / `failure_<component>` | failure label for the supervised and survival layers |
+
+## 6. Outputs and how to read them
+
+`j1939pf analyze … --out out/` writes:
+
+| File | What it is |
+|---|---|
+| `report.html` | self-contained report (no network): health, alerts with the data behind them, trends, what it learned, exposure, oil service, relationships, correlation matrix, anomalies, label layers |
+| `summary.txt` | the same in text form |
+| `alerts.json` / `alerts.csv` | one record per alert episode, plus alerts suppressed by feedback |
+| `alert_data/<alert_id>.csv` | **the data behind each alert**: canonical rows with the learned expected value and z |
+| `trend.csv` | per engine and signal: drift vs the early-hours reference, every 5 engine h |
+| `learned_baselines.csv` | **what it learned**: per operating bin (RPM × oil temp × load), reference median, spread, n, sessions, trusted, current online value |
+| `exposure.csv` | time × severity per condition |
+| `metrics.json` | derived values and flags |
+| `oil_service.csv`, `oil_intervals.csv` | oil changes (logged and/or detected), per-interval pressure trend and oil consumption |
+| `transitions.csv` | change-points and re-baselining decisions |
+| `correlations.csv`, `correlation_matrix_<engine>.csv` | learned relationships, breaks, Spearman matrix |
+| `anomalies.csv`, `anomaly_rates.csv` | joint-signal anomaly episodes and rates |
+| `health.json` | health score with its decomposition |
+| `labels.json`, `kaplan_meier.csv` | supervised and survival layers (or why they are inactive) |
+| `parse_report.json` | decode quality: malformed lines, duplicates, TP stats, per-signal status counts, unverified SPNs |
+
+Every JSON export and report carries the framing statement. `FRAMING.txt` repeats it next to
+the CSVs.
+
+### Health score (0–100), always with its decomposition
+
+The score is a weighted mean of component sub-scores:
+
+* learned oil pressure and filter dp (drift and recent alerts);
+* limit-only oil and coolant temperature;
+* joint anomaly rate;
+* broken learned relationships;
+* DM1 faults;
+* data quality.
+
+Each component shows its sub-score, weight, **points lost**, and reason. The points lost add
+up exactly to 100 − score. Unavailable components are listed with the reason.
+
+**It is distance from this engine's own normal and its limits.** It is not remaining life and
+not a failure probability. New engines say which parts are still in their learning period.
+
+### Alerts
+
+Each alert records:
 
 * the signal and layer;
 * the operating point (RPM, oil temperature, load, dominant bin);
-* expected vs actual values (kPa and psi), z, and duration;
-* a severity: watch, warning, or critical (critical is for manual-limit breaches);
+* expected vs actual (kPa and psi), z, duration and number of runs;
+* severity;
 * a **falsifiable explanation**;
-* confounders: maintenance events in the window, marked as before or after the onset, and
-  ambient temperature shifts;
-* **what to check next**, cheapest first: the reading itself (mechanical gauge,
-  connector/wiring, DTCs), then oil level and grade, then the filter, then mechanical
-  causes.
+* the **sensor-vs-engine verdict** with its evidence;
+* confounders: maintenance events, marked before or after the onset, and ambient shifts;
+* **what to check next**, cheapest first: the reading (gauge, connector, DTCs), then oil
+  level and grade, then the filter, then mechanical causes.
 
-### Sensor fault or engine wear?
-
-Before an alert blames the engine, `sensor_check` weighs the evidence:
-
-* DM1 codes for the SPN with measurement-circuit FMIs (2, 3, 4, 5, 6, 8, 10, 13);
-* error encodings in the samples;
-* an **engine-off zero check**: a stopped engine reads ~0 kPa, so an offset there is the
-  sensor;
-* the deviation pattern: high-RPM-only and proportional patterns point to the oil system,
-  while a uniform-kPa pattern looks like a sensor offset;
-* corroborating signals: filter dp rising, oil level falling.
-
-ECU low-pressure codes (FMI 1/17/18) come from the same sensor and are reported as *not
-independent*. The verdict is `sensor_suspected`, `engine_suspected` or `undetermined`.
-Readings clip at 0 kPa, so a sensor drifting *low* cannot be told apart from uniform wear by
-the zero check. Such cases are reported as `undetermined`, not guessed.
-
-### Synthetic generator (`j1939pf.generator`)
-
-The generator is seeded and works at canonical-series level. `render_candump` turns its
-output into J1939 frames, so the whole pipeline can run end to end.
-
-* Scenarios: healthy, bearing wear, clogged filter, stuck relief valve, failing pump, sensor
-  drift, high-idle duty cycle, chronic cold operation.
-* Events: oil change, oil-grade change, sensor replacement.
-* Each engine draws its own profile, with gaussian, Student-t or AR(1) noise, jittered duty
-  cycles and missing samples.
-* Every generator coefficient is a toy-model parameter, **not an engine specification**.
-* Tests require zero alerts across healthy, high-idle and cold-operation engines under all
-  three noise models and multiple seeds, plus detection of every fault scenario.
-
-Phase 2 lists maintenance events as confounders but does not yet re-baseline after them.
-Re-baselining and the feedback loop come in Phase 4.
-
-## Phase 3: derived values, exposure, oil-change tracking
-
-```python
-from j1939pf.usage import usage_report
-
-rep = usage_report(parsed.canonical, configs, dtc_episodes=parsed.dtc_episodes, events=maintenance_log_df)
-print(rep.summary_text())     # header: exposure framing; exposure is NOT life consumed
-rep.flags()                   # {engine: ["CHRONIC COLD OPERATION ...", "HIGH IDLE ...", "UNLOGGED OIL CHANGE ..."]}
-rep.exposure_frame()          # one row per engine x condition
-rep.oil_history_frame()       # oil service history: logged and/or detected
-rep.engines["SA00"].metrics   # derived values (each says "unavailable: why" when it cannot be computed)
-```
-
-### Derived values
-
-Each value below is either computed, or reported as `unavailable` with the reason: the
-signal isn't broadcast, the limit is missing from the engine config, or the row interval is
-too coarse. All times are counted in canonical rows × row interval.
-
-| Value | Definition |
+| Layer | Meaning |
 |---|---|
-| Idle % | running AND `idle_rpm_band.low ≤ rpm ≤ idle_rpm_band.high` (inclusive) AND load `<` `idle_load_cutoff` (strict). Load is SPN 92, falling back to SPN 513. A row with unknown load is not idle; the unknown-load share is reported. Flagged only above the config's `idle_pct_flag_threshold`. |
-| Idle / working / PTO split | idle vs running-not-idle. PTO and driving are reported as unavailable: there is no verified PTO SPN and vehicle speed is not decoded. |
-| Cold starts, time to temperature | a start whose coolant (or oil) temperature is below the config's low-temp cutoff; minutes until the cutoff is reached (median, p90, never reached). |
-| Low-temp running % | running below the cutoff, both overall and after the first 30 min. **Chronic cold** is flagged when the after-warm-up share exceeds 25 % (a program definition). |
-| Load histogram | % of running time per 10 % load band, plus an RPM × load table. |
-| Fuel-per-power drift | fuel rate ÷ (torque % × rpm) at ≥ 50 % load, compared per RPM × load bin against the first 40 h, with a Theil–Sen trend. A **proxy**, not calibrated BSFC. |
-| Cranking | crank duration and battery-voltage sag per start (SPN 168). Resolution is limited to the row interval, and the report says so. |
-| Torque spikes | a rise of ≥ 50 %-points between rows ≤ 2 s apart. Unavailable on coarser data. |
-| Oil consumption | oil level (SPN 98) slope per oil interval, in %-points/100 h. The sender's % is not converted to litres. |
-| Faults | DM1 episodes per 100 running h, by SPN/FMI, and clusters within 2 engine h. |
-| Hours since service | hours since the last oil change, logged or detected; the source is stated. |
-| Fan on, derate | fan-on uses SPN 975 when it is broadcast. Derate is unavailable: there is no verified derate SPN. |
+| (a) | breach of a limit from your engine config (critical) |
+| (c) | sustained deviation (\|z\| ≥ 4 for ≥ 120 s) from this engine's own learned value at that RPM × oil temp × load |
+| (d) | drift across all learned bins vs the fixed early-hours reference (±4 % with a significant Theil–Sen slope): a trend, not a threshold breach |
 
-### Exposure report (time × severity)
+**Sensor-vs-engine verdicts:**
 
-Each condition reports hours, severity-weighted exposure in a physical unit, episodes, hours
-per 100 running hours, the rate per 50 h period, and its definition:
+* **Sensor evidence:** measurement-circuit FMIs, error encodings, an engine-off reading that
+  is not ~0 kPa, or a uniform-kPa offset.
+* **Engine evidence:** the deviation is confined to high RPM, pressure no longer rises with
+  RPM, the deviation is proportional, or filter dp or oil level corroborate.
+* **`undetermined`** whenever the evidence is missing or conflicting. A sensor drifting low
+  cannot be told apart from uniform wear with one sensor.
 
-* oil pressure below this engine's own baseline (z-hours, broken down by RPM band; this is
-  the headline question, answered as exposure);
+### Exposure (time × severity; not life consumed)
+
+Each condition reports hours, exposure in physical units, episodes, hours per 100 running
+hours, the rate per 50 h period, and its definition:
+
+* **oil pressure below this engine's own baseline**, in z-hours by RPM band. This is the
+  headline question, answered as exposure;
 * oil pressure below the configured minimums (kPa-hours);
-* oil and coolant over-temperature (°C-hours);
-* lugging: RPM ≤ the config's `lugging_rpm_max` (from the manual: below peak-torque speed)
-  at ≥ 80 % load;
-* cold oil at ≥ 75 % of rated RPM;
-* extended idling (> 10 min);
+* over-temperature (°C-hours);
+* lugging;
+* cold oil at high RPM;
+* extended idling;
 * high load while cold;
-* hot shutdowns (stopped within 3 min of ≥ 75 % load);
+* hot shutdowns;
 * low-temperature running after warm-up.
 
-Conditions that need a manual value are unavailable until the config has it. **Exposure is
-not life consumed.** Nothing converts it into life lost.
+### Derived values (`metrics.json`)
 
-### Oil-change detection from oil pressure / temperature vs RPM
+Each value below is computed, or reported as "unavailable: why":
 
-An oil change needs the engine stopped, so every engine-off boundary is a candidate. That
-means a gap between sessions, or a stop of ≥ 20 min. For each boundary the program compares
-this engine's data from 8 engine hours before with 8 hours after:
+* idle % and the idle / working split;
+* cold starts and time to temperature;
+* low-temp running %, flagged **CHRONIC COLD** above 25 % after warm-up;
+* load histogram and RPM × load table;
+* fuel-per-power proxy drift;
+* crank duration and battery-voltage sag (resolution-limited);
+* torque spikes (need rows ≤ 2 s apart);
+* oil consumption per oil interval;
+* DM1 fault frequency and clusters;
+* hours since the last oil change;
+* fan-on %;
+* inferred DPF regenerations.
 
-* **Primary signal: oil pressure at the same RPM × oil temperature × load bins.** Used oil
-  thins, so pressure at a fixed operating point sags over the interval, and fresh oil
-  restores it: a step up.
-* **Supporting signals:**
-  * an oil level step up (SPN 98);
-  * a filter dp step down (new filter, SPN 99);
+PTO, driving and derate are reported as unavailable: there is no verified SPN for them.
+
+Idle % = running AND `low ≤ rpm ≤ high` (inclusive) AND load `<` cutoff (strict). A row with
+unknown load is not idle, and the unknown share is reported. The golden fixture
+`tests/fixtures/idle_golden.log` is computed by hand in `idle_golden.md` (34 / 60 s) and must
+match exactly.
+
+### Oil-change detection and tracking
+
+At every engine-off boundary (between sessions, or a stop ≥ 20 min), the program compares
+this engine's **oil pressure at the same RPM × oil temperature × load** in the 8 engine hours
+before and after. Used oil thins, so pressure sags over an interval; fresh oil steps it back
+up.
+
+* **Supporting evidence:**
+  * oil level up;
+  * filter dp down;
   * a shift in oil temperature vs RPM/load;
-  * the change in the ln(pressure) vs oil-temperature slope at fixed RPM (viscosity
-    behaviour), which is reported.
-* **Self-calibrating:** every step is judged against this engine's own boundary-to-boundary
-  noise. A detection needs a robust z ≥ 3 and a step ≥ 1.5 %. Noise floors match bus
-  resolution: 4 kPa pressure, 0.4 % oil level.
-* **Exclusions:**
-  * A shift in the engine-off (zero) reading at the boundary means the **pressure sensor**
-    changed.
-  * A pressure step **down** is an oil-system step (a thinner grade? dilution?). It is not
-    counted as an oil change.
-  * A level rise without a pressure step is recorded as an `oil_level_rise` (oil added or
-    changed), not a confirmed change.
-* **Reconciliation with the maintenance log:**
-  * `logged; signature confirms`;
-  * `logged; no clear signature`;
-  * `detected; NOT in the maintenance log`, which raises the **UNLOGGED OIL CHANGE** flag.
-    Detected changes are passed to the Phase 2 analysis as confounders.
-* **Tracking:**
-  * the oil service history, with interval lengths;
-  * hours since the last change;
-  * per oil interval, the oil-pressure trend at fixed operating points (%/100 h) and oil
-    consumption.
+  * the ln(pressure) vs oil-temperature slope.
+* **Thresholds calibrate themselves:** a step must stand out from this engine's own
+  boundary-to-boundary noise (robust z ≥ 3, ≥ 1.5 %).
+* **Not counted as an oil change:**
+  * an engine-off zero shift → *sensor change*;
+  * a step down → *oil-system step*;
+  * a level-only rise → *oil level rise*.
+* **Reconciliation with the log:**
+  * *logged; signature confirms*;
+  * *logged; no clear signature*;
+  * *detected; NOT in the log*, which raises the **UNLOGGED OIL CHANGE** flag.
+* Detected changes feed the alert analysis as confounders and change-points.
 
-On synthetic data, all oil changes are found with no false detections across seeds and
-noise models, under normal, high-idle and abusive duty. **Limitation:** when oil runs
-chronically cold, pressure sits against the relief valve and the viscosity step can be
-invisible. Those changes appear only as oil-level rises, if SPN 98 is broadcast.
+### Change-points and re-baselining
 
-The golden fixture `tests/fixtures/idle_golden.log` is a 70 s log covering every idle-rule
-edge case: inclusive band edge, strict load cutoff, not-available load and a duplicate
-frame. It is computed by hand in `tests/fixtures/idle_golden.md` (34 / 60 s = 56.67 %), and
-the test must match it exactly.
+Grade changes and sensor replacements (logged, or detected through the zero shift) trigger a
+**flagged transition**:
 
-The synthetic generator now also models oil ageing (viscosity loss, oil consumption, filter
-loading), maintenance at session starts, cranking with voltage sag, and an `abusive`
-scenario: lugging, high load from a cold start, and no cool-down before shutdown.
-
-## Phase 4: change-points, feedback loop, correlations
-
-```python
-from j1939pf.feedback import FeedbackStore
-from j1939pf.correlation import correlation_report
-
-store = FeedbackStore("feedback.json")             # local, append-only decision log
-rep = usage_report(parsed.canonical, configs, events=log_df)  # passes logged + detected events on
-r = analyze(parsed.canonical, configs, events=rep.events_used, feedback=store)
-store.dismiss(r.alerts[0], "gauge reads the same; known weak pump, replacement booked")
-store.confirm(r.alerts[1], "bearing wear confirmed at teardown")
-r.transitions                                       # re-baselining record per change-point
-r.suppressed                                        # alerts silenced by a dismissal (with the reason)
-corr = correlation_report(r, configs, events=rep.events_used)
-print(corr.summary_text()); corr.flags()            # {"SA00": ["RELATIONSHIP BROKE: boost_vs_fuel_rate ..."]}
-```
-
-### Change-points: re-baselining, not alert floods
-
-Change-points come from the maintenance log, plus the oil and sensor changes detected in
-Phase 3.
-
-| Event | Handling |
-|---|---|
-| Oil-grade change | **Multiplicative re-baseline** of oil pressure and filter dp, since viscosity scales both. |
-| Sensor replacement (logged, or detected by the engine-off zero shift) | **Additive re-baseline** of that sensor's signal (default: oil pressure). |
-| Oil change | No re-baseline: fresh oil restores the reference state. It is recorded as a transition. A low drift that **resets** at an oil change is annotated "consistent with oil ageing rather than wear". |
-| Season | Reported as a transition when the ambient median moves more than 10 °C. Bins already hold oil temperature constant. |
-
-How a re-baseline works:
-
-* For `relearn_h` (10 engine h) after the event, that signal is **not judged**. This is a
-  flagged transition.
-* The step is then measured per operating bin: 10 h before vs 10 h after, weighted median.
-* It is applied causally, at the exact end of the transition.
-* The step is **measured locally**, not against the original reference. Wear that had
-  already accumulated is therefore kept, not absorbed (tested: bearing wear still alerts
-  across a grade change).
-* A step larger than the event can explain (> 15 % for a grade change, > 30 kPa for a
-  sensor) is **refused**. The change stays visible to the alerts.
-* A change-point inside the learning window restarts learning.
-* Tested: a ±12 kPa sensor replacement and a −10 %/+8 % grade change, each on top of 100 h
-  oil changes, give **zero alerts**. The measured steps come within 2.5 kPa / 1.5 % of the
-  truth.
+* The signal is not judged for 10 engine hours.
+* The step is then measured per operating bin, 10 h before vs 10 h after, and applied at
+  exactly the end of the transition.
+* Because the step is measured locally, accumulated wear is **not** absorbed.
+* Steps too large to blame on the event (> 15 % or > 30 kPa) are **refused** and stay
+  visible to the alerts.
+* Oil changes are recorded but not re-baselined: fresh oil restores the reference state. A
+  drift that resets at an oil change is annotated "consistent with oil ageing".
 
 ### Feedback loop
 
-`FeedbackStore` saves confirm/dismiss decisions to a local JSON file. Records are
-append-only, and a reason is required.
+```bash
+j1939pf feedback dismiss --store feedback.json --alerts out/alerts.json --alert-id 4583d750aa30 --reason "gauge reads the same"
+j1939pf feedback confirm --store feedback.json --alerts out/alerts.json --alert-id 29d2102d3727 --reason "pump wear at teardown"
+j1939pf explain --out out/ --alert-id 4583d750aa30
+```
 
-* Each alert has a stable `pattern_key`: engine | layer | signal | direction | where (the
-  RPM band, the limit name, or "engine").
-* **Dismissed:** the pattern is suppressed on later runs and listed in `suppressed` with the
-  reason. It comes back only on **new evidence**:
-  * the deviation grows to at least 1.5× its size when dismissed (for layer c, the larger of
-    the episode median |z| and the most recent 20 %), or
-  * a DM1 code for the SPN appears after the dismissal.
-  The re-raised alert says why it returned.
-* **Confirmed:** the pattern is escalated one severity level, cites the confirmation, and is
-  detected at 0.75× the normal z / drift threshold, so it is followed earlier.
+* Decisions go to an append-only JSON file, and a reason is required.
+* **Dismissed** patterns (engine | layer | signal | direction | RPM band) stay quiet. They
+  are listed under "suppressed" with the reason until there is **new evidence**: the
+  deviation grows ≥ 1.5×, or a new DM1 code appears for that SPN.
+* **Confirmed** patterns are escalated one severity level and detected at 0.75× the normal
+  threshold.
 
-### Correlation discovery
+### Learned relationships (`correlations.csv`)
 
 Each relationship reports:
 
-* Spearman rho with a 95 % CI (bootstrap over sessions, seeded);
-* n rows **and** n independent units (sessions, blocks, periods or engines);
+* Spearman rho with a session-bootstrap 95 % CI;
+* n rows and n independent sessions, blocks, periods or engines;
 * the valid operating range and condition;
 * the confounders;
 * a status.
 
 | Kind | Relationships |
 |---|---|
-| Curve (learned on the reference window, re-checked every 25 h) | oil pressure vs RPM (oil temperature held ±5 °C), coolant temperature vs load, boost vs fuel rate, fuel pressure vs fuel rate, turbo speed vs boost, coolant pressure vs coolant temperature, DPF dp vs fuel rate |
-| Trend vs engine hours | oil-pressure drift, crankcase pressure, oil level, coolant level, DPF ash |
-| Per period / across the fleet | idle % vs oil-pressure degradation, idle % vs regen frequency, low-temp % vs wear trend |
+| Curves (learned on the reference window, re-checked every 25 h) | oil pressure vs RPM at fixed oil temperature, coolant vs load, boost vs fuel rate, fuel pressure vs fuel rate, turbo speed vs boost, coolant pressure vs temperature, DPF dp vs fuel rate |
+| Trends vs engine hours | oil-pressure drift, crankcase pressure, oil level, coolant level, DPF ash |
+| Per period and across the fleet | idle % vs oil-pressure degradation, idle % vs regen frequency, low-temp % vs wear trend |
 
-* **Break detection:** a curve is **BROKEN** when two consecutive periods sit at least 3
-  reference spreads off it, and the result is flagged (`RELATIONSHIP BROKE`). A break that
-  coincides with a known change-point is reported as "broken (explained)".
-  * Tested: a synthetic charge-air leak breaks boost vs fuel rate at its onset, while turbo
-    speed vs boost correctly stays stable.
-  * A grade change shows as an explained break.
-* Period and fleet relationships with fewer than 8 points are labelled **inconclusive**
-  rather than over-claimed.
-* **Regenerations are INFERRED** from DPF dp drops, since there is no verified regen-status
-  SPN. On synthetic data they match on normal duty, but idle-heavy duty is over-counted by
-  about 35 %.
+* **BROKEN** = two consecutive periods ≥ 3 reference spreads off the learned curve (flag
+  **RELATIONSHIP BROKE**). *Broken (explained)* = the break coincides with a known
+  change-point.
+* Fewer than 8 points = **inconclusive**.
+* Correlation is association in your data, not cause.
 
-The generator now also produces:
+### Joint-signal anomalies
 
-* boost and turbo speed;
-* intake manifold and exhaust temperature;
-* fuel delivery pressure;
-* crankcase pressure (slow blow-by growth);
-* coolant pressure and level;
-* DPF dp from a soot model with active regenerations;
-* ash load;
-* a `boost_leak` fault.
+* Each signal is first turned into a **residual from its own reference median at the same
+  RPM × load**, with its learned dependence on ambient temperature removed.
+* Robust Mahalanobis (MCD) and an isolation forest (seeded) score the residual vector,
+  learned on warmed-up reference rows.
+* A row is anomalous only when **both** exceed their 99.5 % reference quantile. Episodes
+  need 120 s.
+* Each episode lists its top deviating signals.
+* This catches combinations the oil layers cannot, such as low boost for the fuel being
+  burned.
+* If a signal is missing it is dropped; if scikit-learn is missing, classical Mahalanobis
+  runs alone; if there is too little data, the reason is stated.
 
-## Honest limitations
+### Label-based layers (`labels.json`)
 
-* The SPN table is unverified (see above). A wrong byte position gives plausible-looking but
-  wrong numbers, so verify the signals you depend on.
-* **Synthetic-data caveat:** the tests run on self-built bus data and self-scripted faults.
-  They prove the plumbing (decoding, reassembly, resampling, equivalence, baselines, alerts)
-  works. They say nothing about real-world accuracy. Thresholds were checked against several
-  noise models and seeds so they are not tuned to one scenario, but real engines will differ.
-* Normal oil ageing makes healthy engines drift a few % within each oil interval. The drift
-  threshold allows for it, and a low drift that resets at an oil change is annotated as oil
-  ageing. With very long oil intervals that margin is thinner.
-* Correlations are associations in one engine's own data, not causes. Fleet-level
-  relationships need many engines before they mean anything.
-* Without failure labels, alerts report deviation, exposure and trend. They never say a
-  condition shortens life, and there is no life-loss formula anywhere.
-* CSV inputs carry no raw frames, so they have no TP/DM1 frame decoding. DM1 lamp and count
-  columns can be mapped if the logger exports them.
-* A single corrupted far-future timestamp would make later samples look "late". Such drops
-  are counted in `report["canonical"]["late_samples_dropped"]`, so check it.
-* Live socketCAN input (bonus) is not implemented.
-* Off-bus data (oil analysis, vibration, weather, inspections) is out of scope by design.
+These are the **only** layers allowed to say anything about failure risk or life.
+
+* **Supervised:**
+  * Rows are engine × 50 h periods of exposure rates and drift. The label is a failure
+    within 200 engine h.
+  * Logistic regression with `class_weight="balanced"` (class imbalance) and **engine-grouped
+    cross-validation**.
+  * Reports out-of-fold ROC AUC with an engine-bootstrap CI, PR AUC vs the base rate, and the
+    counts.
+  * Skill is claimed only when the AUC CI lower bound is above 0.5. Probabilities are not
+    calibrated and are not reported as such.
+  * Needs ≥ 10 pre-failure periods from ≥ 5 failed engines.
+* **Survival:**
+  * Kaplan–Meier with left truncation, plus a Weibull accelerated-failure-time model by
+    maximum likelihood.
+  * Covariate effects are reported as **time ratios with 95 % CI**: < 1 means shorter time
+    to failure per unit of exposure.
+  * Remaining life is a conditional median with a parameter-uncertainty CI, and only with
+    ≥ 10 failures.
+* With fewer labels: **"INSUFFICIENT DATA: … No prediction made."** With none: "no failure
+  labels … exposure and trend only."
+
+## 7. How it works (by layer)
+
+1. **Parser.**
+   * 29-bit ID → priority, PGN (PDU1/PDU2), source and destination address.
+   * TP.CM/TP.DT reassembly: BAM and RTS/CTS, J1939-21 timeouts, lost, duplicate and
+     conflicting packets. A message is emitted only when complete.
+   * Data-driven SPN decode. Not-available, error, reserved and out-of-range values →
+     **NULL**, counted in `<signal>__err`.
+   * DM1/DM2 decode into lamps, SPN/FMI/OC and DTC episodes.
+2. **Canonical series.**
+   * One row per engine per interval (default 1 s).
+   * Fast signals are averaged; slow signals are held only briefly; errors are never held.
+   * Clock gaps start a new segment; late samples are dropped and counted.
+3. **Baselines.**
+   * Per RPM (100) × oil temp (5 °C) × load (25 %) bin.
+   * Learned from the first 40 eligible engine hours: running, past the startup grace, no
+     active DM1, decoded OK.
+   * A bin is trusted at ≥ 30 rows from ≥ 3 sessions.
+   * The spread includes session-to-session variation and is floored at the bus resolution
+     (4 kPa for oil pressure) and at 2.5 %.
+   * The online baseline follows slowly but is capped at ±3 %, so slow faults are flagged,
+     not absorbed.
+4. **Layers (a), (c), (d), sensor check, exposure, oil tracking, change-points, feedback,
+   correlations, anomalies, labels, health:** described above.
+
+All tunable numbers live in `config/defaults.yaml`, grouped by section and labelled as
+program defaults.
+
+## 8. Honest limitations
+
+* **Synthetic validation only.** Detection rates, zero-false-alert results and thresholds
+  were checked on a toy engine model with several noise models and seeds, so they are not
+  tuned to one scenario. They are not evidence of real-world performance.
+* **The SPN table is unverified.** A wrong byte position gives plausible-looking but wrong
+  numbers.
+* **Exposure is not life consumed.** Nothing in the program converts exposure or deviation
+  into life lost. Life statements come only from the label layers, with n and CIs, and only
+  with enough failures. A handful of failures is not enough, and the program says so.
+* **Sensor vs wear is sometimes undecidable.** A pressure sensor drifting *low* looks like
+  uniform wear (readings clip at 0 kPa, so the zero check cannot see it). The verdict is
+  then `undetermined`, and the first check is always the mechanical gauge.
+* **Oil ageing uses part of the trend margin.** Normal oil ageing makes healthy engines
+  drift a few % within each oil interval, and the 4 % trend threshold allows for it. Very
+  long intervals narrow the margin.
+* **Cold oil hides oil changes.** With chronically cold oil, pressure sits on the relief
+  valve and a fresh-oil step can be invisible; such changes show only as oil-level rises.
+* **Inferred regens.** DPF regenerations are inferred from DPF dp drops (no verified
+  regen-status SPN). Idle-heavy duty is over-counted by ~35 % on synthetic data.
+* **The joint anomaly layer is supplementary.** It finds faults the oil layers miss (charge-
+  air leak), but can miss some the oil layers catch strongly (one stuck-valve seed in
+  testing). Unusual ambient conditions outside the reference range can raise its rate.
+* **Coarse row intervals limit some metrics.** At 10 s rows, crank duration, voltage sag and
+  torque spikes are resolution-limited or unavailable, and the outputs say so.
+* **CSV inputs have no DM1 frames** unless the logger exports DM1 columns.
+* **Not built:** live socketCAN input (bonus).
+* **Out of scope by design:** off-bus data (oil analysis, vibration, weather, inspections).
+* **Correlations are associations.** Fleet-level relationships need many engines before they
+  mean anything.
+
+## 9. Project layout
+
+```
+src/j1939pf/   ids, spn_table, transport, dm, candump, csv_source, decoder, canonical, pipeline   (parse)
+               engine_config, baseline, detection, alerts, sensor_check, analysis                 (layers a-d)
+               derived, exposure, oil_change, usage                                               (exposure)
+               feedback, correlation                                                              (phase 4)
+               anomaly, labels, health, report, html_report, io, cli                              (phase 5)
+               generator, encode                                                                  (synthetic data)
+config/        spn_table.yaml, defaults.yaml, csv_mapping.example.yaml, engines/
+tests/         one file per phase + test_acceptance.py (maps every acceptance item to its test)
+```

@@ -1,0 +1,28 @@
+# Column mapping for a telematics CSV export. Copy and edit per logger.
+layout: wide                 # wide: one column per signal | long: signal/value columns
+timestamp:
+  column: timestamp
+  format: iso8601            # iso8601 | epoch_s | epoch_ms | epoch_us | a strftime pattern
+  timezone: UTC              # applied only to timestamps that carry no offset
+engine:
+  column: source_address     # omit `column` to put every row on `default`
+  kind: source_address       # source_address (decimal or 0x.. hex; mapped like candump) | name
+  default: SA00
+na_values: ["NA", "N/A", "null"]     # explicit "not available" tokens (blank cells = no sample)
+error_values: ["ERR", "ERROR"]       # explicit sensor-error tokens
+chunksize: 100000
+columns:
+  # file column: {spn: N | canonical: name, unit: unit-in-file}
+  # Units are converted to the SPN table unit. Known units: kPa psi bar degC degF K
+  # rpm % L/h gal/h L gal V A h state count
+  rpm:            {spn: 190, unit: rpm}
+  load_pct:       {spn: 92,  unit: "%"}
+  oil_press_psi:  {spn: 100, unit: psi}
+  oil_temp_f:     {spn: 175, unit: degF}
+  coolant_temp_f: {spn: 110, unit: degF}
+  fuel_rate_gph:  {spn: 183, unit: gal/h}
+  # long layout instead:
+  # layout: long
+  # signal_column: name
+  # value_column: value
+  # signals: {EngineSpeed: {spn: 190, unit: rpm}, ...}

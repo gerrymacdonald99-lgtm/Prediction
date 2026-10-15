@@ -1,0 +1,191 @@
+# J1939 SPN decode table -- EDITABLE DATA, not code.
+#
+# EVERY entry ships with `verified: false`. Byte/bit positions, scaling and
+# ranges below were transcribed from memory of SAE J1939-71 / J1939DA and
+# MUST be checked against your licensed copy of J1939DA (or the engine OEM's
+# J1939 broadcast list) before the decoded values are trusted. Set
+# `verified: true` only after that check, and record the source in `notes`.
+#
+# Field conventions (J1939-71 style):
+#   start_byte  1-based byte index in the PGN payload (byte 1 = first byte)
+#   start_bit   1-based bit index inside start_byte (bit 1 = LSB)
+#   length_bits field length; multi-byte values are little-endian (Intel)
+#   physical = raw * scale + offset, in `unit`
+#   valid_min / valid_max: decoded values outside this range -> NULL, counted
+#                          as `out_of_range`
+#   na_handling:
+#     standard  J1939-71 ranges by field length:
+#               2 bit: 2=error 3=not available; 4 bit: 14=error 15=n/a;
+#               8/16/32 bit: most-significant byte 0xFB-0xFD reserved,
+#               0xFE error indicator, 0xFF not available.
+#     explicit  use the `na_raw` / `error_raw` lists on the entry instead.
+#   Not-available / error / reserved / out-of-range values decode to NULL,
+#   never to a reading.
+#   aggregate   how samples inside one resample interval are combined
+#               (mean | last | max | min)
+#   rate_ms     TYPICAL broadcast period (unverified; OEMs differ). Used only
+#               to choose how long a value may be held across empty intervals.
+#   attribute_to: source (default) -> the value belongs to the sender's SA;
+#               destination -> belongs to the DA (e.g. TSC1 is a COMMAND sent
+#               *to* the engine by another controller).
+#   oem_specific: true -> decoded only where actually broadcast; absence is
+#               normal and must never be read as "zero".
+
+meta:
+  standard_reference: "SAE J1939-71 / J1939DA (not bundled; verify against your licensed copy)"
+  all_entries_verified: false
+
+signals:
+  # ---------------------------------------------------------------- EEC1
+  - {pgn: 61444, pgn_acronym: EEC1, spn: 512, name: "Driver's Demand Engine - Percent Torque", canonical: driver_demand_torque_pct,
+     start_byte: 2, start_bit: 1, length_bits: 8, scale: 1.0, offset: -125.0, unit: "%", valid_min: -125, valid_max: 125,
+     na_handling: standard, aggregate: mean, rate_ms: 20, verified: false}
+  - {pgn: 61444, pgn_acronym: EEC1, spn: 513, name: "Actual Engine - Percent Torque", canonical: actual_torque_pct,
+     start_byte: 3, start_bit: 1, length_bits: 8, scale: 1.0, offset: -125.0, unit: "%", valid_min: -125, valid_max: 125,
+     na_handling: standard, aggregate: mean, rate_ms: 20, verified: false,
+     notes: "Fallback load signal when SPN 92 is not broadcast."}
+  - {pgn: 61444, pgn_acronym: EEC1, spn: 190, name: "Engine Speed", canonical: engine_speed_rpm,
+     start_byte: 4, start_bit: 1, length_bits: 16, scale: 0.125, offset: 0.0, unit: rpm, valid_min: 0, valid_max: 8031.875,
+     na_handling: standard, aggregate: mean, rate_ms: 20, verified: false,
+     notes: "EEC1 repetition is engine-speed dependent (~10-20 ms)."}
+
+  # ---------------------------------------------------------------- EEC2
+  - {pgn: 61443, pgn_acronym: EEC2, spn: 91, name: "Accelerator Pedal Position 1", canonical: accel_pedal_pct,
+     start_byte: 2, start_bit: 1, length_bits: 8, scale: 0.4, offset: 0.0, unit: "%", valid_min: 0, valid_max: 100,
+     na_handling: standard, aggregate: mean, rate_ms: 50, verified: false}
+  - {pgn: 61443, pgn_acronym: EEC2, spn: 92, name: "Engine Percent Load At Current Speed", canonical: load_at_speed_pct,
+     start_byte: 3, start_bit: 1, length_bits: 8, scale: 1.0, offset: 0.0, unit: "%", valid_min: 0, valid_max: 250,
+     na_handling: standard, aggregate: mean, rate_ms: 50, verified: false,
+     notes: "Default idle-load SPN. Data range believed 0-250 %, operational 0-125 %; verify."}
+
+  # ---------------------------------------------------------------- EFL/P1
+  - {pgn: 65263, pgn_acronym: EFL/P1, spn: 94, name: "Engine Fuel Delivery Pressure", canonical: fuel_delivery_pressure_kpa,
+     start_byte: 1, start_bit: 1, length_bits: 8, scale: 4.0, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 1000,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+  - {pgn: 65263, pgn_acronym: EFL/P1, spn: 98, name: "Engine Oil Level", canonical: oil_level_pct,
+     start_byte: 3, start_bit: 1, length_bits: 8, scale: 0.4, offset: 0.0, unit: "%", valid_min: 0, valid_max: 100,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+  - {pgn: 65263, pgn_acronym: EFL/P1, spn: 100, name: "Engine Oil Pressure", canonical: oil_pressure_kpa,
+     start_byte: 4, start_bit: 1, length_bits: 8, scale: 4.0, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 1000,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false,
+     notes: "4 kPa/bit = ~0.58 psi/bit. Baseline spreads must be floored at this quantization."}
+  - {pgn: 65263, pgn_acronym: EFL/P1, spn: 101, name: "Engine Crankcase Pressure", canonical: crankcase_pressure_kpa,
+     start_byte: 5, start_bit: 1, length_bits: 16, scale: 0.0078125, offset: -250.0, unit: kPa, valid_min: -250, valid_max: 251.99,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+  - {pgn: 65263, pgn_acronym: EFL/P1, spn: 109, name: "Engine Coolant Pressure", canonical: coolant_pressure_kpa,
+     start_byte: 7, start_bit: 1, length_bits: 8, scale: 2.0, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 500,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+  - {pgn: 65263, pgn_acronym: EFL/P1, spn: 111, name: "Engine Coolant Level", canonical: coolant_level_pct,
+     start_byte: 8, start_bit: 1, length_bits: 8, scale: 0.4, offset: 0.0, unit: "%", valid_min: 0, valid_max: 100,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+
+  # ---------------------------------------------------------------- DD (SPN 99 placement)
+  - {pgn: 65276, pgn_acronym: DD, spn: 99, name: "Engine Oil Filter Differential Pressure", canonical: oil_filter_dp_kpa,
+     start_byte: 4, start_bit: 1, length_bits: 8, scale: 0.5, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 125,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false,
+     notes: "The draft table listed SPN 99 under PGN 65263 (EFL/P1). My reading of J1939-71 places it in PGN 65276 Dash Display byte 4. VERIFY which PGN your engine uses."}
+
+  # ---------------------------------------------------------------- ET1
+  - {pgn: 65262, pgn_acronym: ET1, spn: 110, name: "Engine Coolant Temperature", canonical: coolant_temp_c,
+     start_byte: 1, start_bit: 1, length_bits: 8, scale: 1.0, offset: -40.0, unit: degC, valid_min: -40, valid_max: 210,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false}
+  - {pgn: 65262, pgn_acronym: ET1, spn: 174, name: "Engine Fuel Temperature 1", canonical: fuel_temp_c,
+     start_byte: 2, start_bit: 1, length_bits: 8, scale: 1.0, offset: -40.0, unit: degC, valid_min: -40, valid_max: 210,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false}
+  - {pgn: 65262, pgn_acronym: ET1, spn: 175, name: "Engine Oil Temperature 1", canonical: oil_temp_c,
+     start_byte: 3, start_bit: 1, length_bits: 16, scale: 0.03125, offset: -273.0, unit: degC, valid_min: -273, valid_max: 1734.96875,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false}
+
+  # ---------------------------------------------------------------- IC1
+  - {pgn: 65270, pgn_acronym: IC1, spn: 102, name: "Engine Intake Manifold #1 Pressure (boost)", canonical: boost_kpa,
+     start_byte: 2, start_bit: 1, length_bits: 8, scale: 2.0, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 500,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false,
+     notes: "Gauge vs absolute pressure convention differs by OEM; verify."}
+  - {pgn: 65270, pgn_acronym: IC1, spn: 105, name: "Engine Intake Manifold 1 Temperature", canonical: intake_manifold_temp_c,
+     start_byte: 3, start_bit: 1, length_bits: 8, scale: 1.0, offset: -40.0, unit: degC, valid_min: -40, valid_max: 210,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+  - {pgn: 65270, pgn_acronym: IC1, spn: 107, name: "Engine Air Filter 1 Differential Pressure", canonical: air_filter_dp_kpa,
+     start_byte: 5, start_bit: 1, length_bits: 8, scale: 0.05, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 12.5,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false,
+     notes: "Believed broadcast in IC1 byte 5 (answering the draft's question); verify."}
+  - {pgn: 65270, pgn_acronym: IC1, spn: 173, name: "Engine Exhaust Gas Temperature", canonical: exhaust_temp_c,
+     start_byte: 6, start_bit: 1, length_bits: 16, scale: 0.03125, offset: -273.0, unit: degC, valid_min: -273, valid_max: 1734.96875,
+     na_handling: standard, aggregate: mean, rate_ms: 500, verified: false}
+
+  # ---------------------------------------------------------------- WFI (SPN 97 placement)
+  - {pgn: 65279, pgn_acronym: WFI/OI, spn: 97, name: "Water In Fuel Indicator 1", canonical: water_in_fuel,
+     start_byte: 1, start_bit: 1, length_bits: 2, scale: 1.0, offset: 0.0, unit: state, valid_min: 0, valid_max: 1,
+     na_handling: standard, aggregate: max, rate_ms: 10000, verified: false,
+     notes: "The draft table's placement was doubtful. Believed PGN 65279 (Water in Fuel Indicator / Operator Indicators) byte 1 bits 1-2: 0=no 1=yes 2=error 3=n/a. VERIFY."}
+
+  # ---------------------------------------------------------------- LFE1
+  - {pgn: 65266, pgn_acronym: LFE1, spn: 183, name: "Engine Fuel Rate", canonical: fuel_rate_lph,
+     start_byte: 1, start_bit: 1, length_bits: 16, scale: 0.05, offset: 0.0, unit: L/h, valid_min: 0, valid_max: 3212.75,
+     na_handling: standard, aggregate: mean, rate_ms: 100, verified: false}
+
+  # ---------------------------------------------------------------- VEP1
+  - {pgn: 65271, pgn_acronym: VEP1, spn: 168, name: "Battery Potential / Power Input 1", canonical: battery_v,
+     start_byte: 5, start_bit: 1, length_bits: 16, scale: 0.05, offset: 0.0, unit: V, valid_min: 0, valid_max: 3212.75,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false,
+     notes: "1 s broadcast is too slow to see crank voltage sag in detail; later phases must say so."}
+
+  # ---------------------------------------------------------------- AMB
+  - {pgn: 65269, pgn_acronym: AMB, spn: 108, name: "Barometric Pressure", canonical: baro_kpa,
+     start_byte: 1, start_bit: 1, length_bits: 8, scale: 0.5, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 125,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false}
+  - {pgn: 65269, pgn_acronym: AMB, spn: 171, name: "Ambient Air Temperature", canonical: ambient_temp_c,
+     start_byte: 4, start_bit: 1, length_bits: 16, scale: 0.03125, offset: -273.0, unit: degC, valid_min: -273, valid_max: 1734.96875,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false}
+  - {pgn: 65269, pgn_acronym: AMB, spn: 172, name: "Engine Air Inlet Temperature", canonical: air_inlet_temp_c,
+     start_byte: 6, start_bit: 1, length_bits: 8, scale: 1.0, offset: -40.0, unit: degC, valid_min: -40, valid_max: 210,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, verified: false}
+
+  # ---------------------------------------------------------------- HOURS / LFC
+  - {pgn: 65253, pgn_acronym: HOURS, spn: 247, name: "Engine Total Hours of Operation", canonical: engine_hours_h,
+     start_byte: 1, start_bit: 1, length_bits: 32, scale: 0.05, offset: 0.0, unit: h, valid_min: 0, valid_max: 210554060.75,
+     na_handling: standard, aggregate: last, rate_ms: 1000, max_hold_s: 3600, verified: false,
+     notes: "Often on-request only; held up to 1 h because it changes slowly."}
+  - {pgn: 65257, pgn_acronym: LFC, spn: 250, name: "Engine Total Fuel Used", canonical: total_fuel_l,
+     start_byte: 5, start_bit: 1, length_bits: 32, scale: 0.5, offset: 0.0, unit: L, valid_min: 0, valid_max: 2105540607.5,
+     na_handling: standard, aggregate: last, rate_ms: 1000, max_hold_s: 3600, verified: false}
+
+  # ---------------------------------------------------------------- TSC1 (command TO the engine)
+  - {pgn: 0, pgn_acronym: TSC1, spn: 898, name: "Engine Requested Speed/Speed Limit", canonical: tsc1_requested_speed_rpm,
+     start_byte: 2, start_bit: 1, length_bits: 16, scale: 0.125, offset: 0.0, unit: rpm, valid_min: 0, valid_max: 8031.875,
+     na_handling: standard, aggregate: mean, rate_ms: 10, attribute_to: destination, verified: false,
+     notes: "TSC1 is PDU1: attributed to the destination (the engine being commanded), not the sender."}
+  - {pgn: 0, pgn_acronym: TSC1, spn: 518, name: "Engine Requested Torque/Torque Limit", canonical: tsc1_requested_torque_pct,
+     start_byte: 4, start_bit: 1, length_bits: 8, scale: 1.0, offset: -125.0, unit: "%", valid_min: -125, valid_max: 125,
+     na_handling: standard, aggregate: mean, rate_ms: 10, attribute_to: destination, verified: false}
+
+  # ---------------------------------------------------------------- OEM-specific / optional
+  # Decoded only where broadcast. Positions are LOW-CONFIDENCE; verify before use.
+  - {pgn: 65245, pgn_acronym: TC1, spn: 103, name: "Engine Turbocharger 1 Speed", canonical: turbo_speed_rpm,
+     start_byte: 2, start_bit: 1, length_bits: 16, scale: 4.0, offset: 0.0, unit: rpm, valid_min: 0, valid_max: 257020,
+     na_handling: standard, aggregate: mean, rate_ms: 500, oem_specific: true, verified: false}
+  - {pgn: 65213, pgn_acronym: FD, spn: 975, name: "Estimated Percent Fan Speed", canonical: fan_speed_pct,
+     start_byte: 1, start_bit: 1, length_bits: 8, scale: 0.4, offset: 0.0, unit: "%", valid_min: 0, valid_max: 100,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, oem_specific: true, verified: false}
+  - {pgn: 65213, pgn_acronym: FD, spn: 977, name: "Fan Drive State", canonical: fan_drive_state,
+     start_byte: 2, start_bit: 1, length_bits: 4, scale: 1.0, offset: 0.0, unit: state, valid_min: 0, valid_max: 13,
+     na_handling: standard, aggregate: max, rate_ms: 1000, oem_specific: true, verified: false,
+     notes: "Enumerated state; meaning of each value must be taken from J1939DA."}
+  - {pgn: 64946, pgn_acronym: AT1IMG, spn: 3251, name: "Aftertreatment 1 DPF Differential Pressure", canonical: dpf_dp_kpa,
+     start_byte: 5, start_bit: 1, length_bits: 16, scale: 0.1, offset: 0.0, unit: kPa, valid_min: 0, valid_max: 6425.5,
+     na_handling: standard, aggregate: mean, rate_ms: 500, oem_specific: true, verified: false,
+     notes: "LOW CONFIDENCE on PGN/byte position."}
+  - {pgn: 64891, pgn_acronym: AT1S, spn: 3720, name: "Aftertreatment 1 DPF Ash Load Percent", canonical: dpf_ash_load_pct,
+     start_byte: 2, start_bit: 1, length_bits: 8, scale: 1.0, offset: 0.0, unit: "%", valid_min: 0, valid_max: 250,
+     na_handling: standard, aggregate: last, rate_ms: 1000, oem_specific: true, verified: false,
+     notes: "LOW CONFIDENCE on PGN/byte position."}
+  - {pgn: 65110, pgn_acronym: AT1T1I, spn: 1761, name: "Aftertreatment 1 DEF Tank Volume", canonical: def_level_pct,
+     start_byte: 1, start_bit: 1, length_bits: 8, scale: 0.4, offset: 0.0, unit: "%", valid_min: 0, valid_max: 100,
+     na_handling: standard, aggregate: mean, rate_ms: 1000, oem_specific: true, verified: false}
+
+# Not in the table yet (need a verified source before adding): SCR temperatures,
+# NOx sensors, EGR valve position, PTO status, derate status. They are decoded
+# only after an entry with a checked position is added here.
+#
+# Handled in code, not by this table (fixed structure):
+#   PGN 65226 DM1 / 65227 DM2  lamps + SPN/FMI/OC list (J1939-73, conversion method 4)
+#   PGN 60416 TP.CM / 60160 TP.DT  transport protocol (J1939-21) BAM and RTS/CTS

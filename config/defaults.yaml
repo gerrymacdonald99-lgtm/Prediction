@@ -1,0 +1,30 @@
+# TUNABLE PROGRAM DEFAULTS -- these are NOT engine specifications.
+# Engine limits (oil pressure minimums, max temperatures, rated RPM, ...) live
+# in the per-engine config written from THAT engine's manual (added in phase 2).
+
+seed: 0
+
+canonical:
+  resample_interval_s: 1.0     # one canonical row per engine per interval
+  gap_s: 5.0                   # silence longer than this starts a new segment (no fill across it)
+  lateness_s: 2.0              # how far out of order a sample may arrive before it is dropped (and counted)
+  default_max_hold_s: 3.0      # floor on how long a value is held across empty intervals
+  hold_rate_multiple: 3.0      # hold = max(default_max_hold_s, multiple * typical broadcast period)
+
+frames:
+  duplicate_window_s: 0.0005   # identical (interface, ID, data) within this window = duplicate capture
+
+transport:                     # J1939-21 timeouts, seconds (passive observer)
+  t1_s: 0.75                   # max gap between TP.DT packets
+  t2_s: 1.25                   # max wait for data after CTS
+  t3_s: 1.25                   # max wait for CTS / EOM ack after last packet
+  t4_s: 1.05                   # max hold after CTS(0)
+
+dtc:
+  episode_gap_s: 10.0          # same SPN/FMI unseen longer than this -> a new DTC episode
+
+sources:
+  # Each source address is a separate engine unless mapped here.
+  # Example: {0: engine_1, 1: engine_2, 61: engine_1}   (61 = 0x3D aftertreatment ECU)
+  engine_map: {}
+  ignore_source_addresses: []

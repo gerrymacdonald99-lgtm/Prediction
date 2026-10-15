@@ -65,3 +65,36 @@ sensor_check:
   zero_check_tolerance_steps: 2  # allowed engine-off reading shift, in bus resolution steps
   err_fraction_suspect: 0.01     # >1 % error-coded samples in the window -> sensor/wiring suspected
   sensor_fmis: [2, 3, 4, 5, 6, 8, 10, 13]  # J1939-73 FMIs describing the measurement, not the quantity
+
+# ---------------------------------------------------------------------------
+# Oil-change detection from J1939 signatures (phase 3). TUNABLE program defaults.
+oil_change:
+  window_h: 8                    # engine hours compared on each side of an engine-off boundary
+  min_off_minutes: 20            # an oil change needs the engine stopped at least this long
+  min_bin_samples: 10            # rows per operating bin on each side
+  min_bins: 5                    # comparable bins needed to measure a step
+  step_min_rel: 0.015            # minimum pressure step (fraction) ...
+  robust_z_min: 3.0              # ... and it must stand out from this engine's own boundary-to-boundary noise
+  level_step_min_pct: 1.0        # oil level rise that supports an oil change (SPN 98 resolution is 0.4 %)
+  match_window_h: 12             # a detection within this many engine hours of a logged event matches it
+
+# ---------------------------------------------------------------------------
+# Derived values and exposure (phase 3). TUNABLE definitions, NOT engine specs.
+# Engine-specific cut-offs (idle band, idle load cutoff, low-temp cutoffs, lugging RPM,
+# rated RPM, max temps) come from the engine config; without them a metric says "unavailable".
+derived:
+  warmup_exclusion_min: 30       # low-temp running is also reported excluding this long after each start
+  chronic_cold_pct: 25           # FLAG: low-temp running % (after warm-up) above this
+  extended_idle_min: 10          # an idle run longer than this counts as extended idling
+  torque_spike_pct: 50           # actual torque rise of this many %-points between rows ...
+  torque_spike_max_dt_s: 2       # ... only judged when rows are at most this far apart
+  fan_on_pct: 10                 # fan speed above this % = fan on
+  cold_high_rpm_frac_of_rated: 0.75
+  lugging_load_min_pct: 80
+  cold_load_min_pct: 75          # abusive: load above this while coolant is below its low-temp cutoff
+  hot_shutdown_load_pct: 75      # abusive: stop within cool-down minutes of load above this
+  hot_shutdown_cooldown_min: 3
+  bsfc_min_load_pct: 50          # fuel-per-power proxy uses rows at or above this load
+  exposure_z_min: 2.0            # oil pressure below its own baseline counts from z <= -2
+  fault_cluster_gap_h: 2.0       # DTC episodes starting within this many engine hours form a cluster
+  period_h: 50                   # exposure rates are also reported per period of this many engine hours

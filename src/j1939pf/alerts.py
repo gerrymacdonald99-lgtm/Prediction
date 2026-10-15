@@ -83,7 +83,7 @@ def check_next(signal: str, verdict: str, pattern: str, direction: str) -> list[
     steps.append("Check oil level (dipstick) and confirm the oil grade in the sump matches the configured grade.")
     if direction == "low":
         steps.append("Check the oil filter for restriction (filter dp trend if broadcast; hours since change).")
-        if pattern == "high_rpm_only":
+        if pattern in ("high_rpm_only", "flat_vs_rpm"):
             steps.append("Mechanical: pressure relief/regulator valve (sticking open), then pump capacity/pickup.")
         else:
             steps.append("Mechanical: relief/regulator valve, oil pump and pickup, then bearing clearances "

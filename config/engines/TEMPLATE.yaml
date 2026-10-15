@@ -14,7 +14,8 @@ limits:
   idle_load_cutoff:       null   # {value: .., unit: "%", source: ..}
   coolant_low_temp_cutoff: null
   oil_low_temp_cutoff:     null
-  idle_pct_flag_threshold: null  # {value: .., unit: "%", source: ..}
+  idle_pct_flag_threshold: null  # {value: .., unit: "%", source: ..}  (fleet policy is a valid source)
+  lugging_rpm_max:        null   # below this RPM under high load = lugging (manual: below peak-torque speed)
 load_signal:
   spn: 92                 # SPN 92 percent load at current speed (default)
   fallback_spn: 513       # SPN 513 actual percent torque if 92 is not broadcast

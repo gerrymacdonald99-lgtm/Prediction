@@ -70,6 +70,17 @@ def deviation_pattern(prep: Prepared, sb: SignalBaseline, window: np.ndarray, pa
                 f"deviation is confined to high RPM ({dev_hi:+.0f} kPa at high RPM vs {dev_lo:+.0f} kPa near "
                 f"idle): flow-dependent, as with a relief valve, pump capacity or filter restriction; a sensor "
                 f"offset would shift idle by the same amount", dev)
+    # Does pressure still rise with RPM? A sensor offset keeps the learned rise; a relief valve stuck
+    # open or a pump that cannot keep up flattens it.
+    if np.ptp(rpm) >= 500:
+        w = np.sqrt(g["count"].to_numpy(dtype=float))
+        rise_ref = np.polyfit(rpm, rm, 1, w=w)[0] * 1000
+        rise_now = np.polyfit(rpm, g["median"].to_numpy(), 1, w=w)[0] * 1000
+        if rise_ref > 0 and rise_now < 0.5 * rise_ref and np.median(dev) < -3 * res:
+            return ("flat_vs_rpm",
+                    f"pressure no longer rises with RPM as learned ({rise_now:+.0f} kPa per 1000 rpm now vs "
+                    f"{rise_ref:+.0f} learned): consistent with a relief valve stuck open or pump capacity; a "
+                    f"sensor offset would keep the learned rise", dev)
     add_res = np.median(np.abs(dev - np.median(dev)))
     rel = np.median(dev / rm)
     mul_res = np.median(np.abs(dev - rel * rm))
@@ -141,7 +152,7 @@ def assess(prep: Prepared, sb: SignalBaseline | None, signal: str, window: np.nd
     pattern, ptxt = "unknown", ""
     if sb is not None and sb.status == "active":
         pattern, ptxt, _ = deviation_pattern(prep, sb, window, params)
-        if pattern == "high_rpm_only":
+        if pattern in ("high_rpm_only", "flat_vs_rpm"):
             engine += [ptxt, "(pattern weight x2)"]
         elif pattern == "proportional":
             engine += [ptxt, "(pattern weight x2)"]

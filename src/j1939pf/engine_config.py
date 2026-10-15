@@ -23,6 +23,7 @@ LIMIT_UNITS = {
     "coolant_low_temp_cutoff": "degC",
     "oil_low_temp_cutoff": "degC",
     "idle_pct_flag_threshold": "%",
+    "lugging_rpm_max": "rpm",
 }
 
 

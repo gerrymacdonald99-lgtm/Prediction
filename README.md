@@ -17,15 +17,15 @@ and which way it is trending". Nothing stronger.
 
 ## Build status
 
-The program is built in five phases. **Phases 1 and 2 are implemented.** Later-phase
-modules (exposure reports, correlations, change-point re-baselining, feedback loop,
-anomaly/survival models, HTML reports, CLI) do not exist yet. There are no stubs for them.
+The program is built in five phases. **Phases 1–3 are implemented.** Later-phase modules
+(correlations, change-point re-baselining, feedback loop, anomaly/survival models, HTML
+reports, CLI) do not exist yet. There are no stubs for them.
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Parser, TP reassembly, SPN decode, canonical series | done |
 | 2 | Synthetic generator, baseline layers (a)–(d), core alerts | done |
-| 3 | Derived values, exposure reports | not started |
+| 3 | Derived values, exposure reports, oil-change tracking | done |
 | 4 | Correlations, change-points, feedback loop | not started |
 | 5 | Anomaly detection, supervised/survival, reporting, CLI | not started |
 
@@ -241,6 +241,110 @@ output into J1939 frames, so the whole pipeline can run end to end.
 Phase 2 lists maintenance events as confounders but does not yet re-baseline after them.
 Re-baselining and the feedback loop come in Phase 4.
 
+## Phase 3: derived values, exposure, oil-change tracking
+
+```python
+from j1939pf.usage import usage_report
+
+rep = usage_report(parsed.canonical, configs, dtc_episodes=parsed.dtc_episodes, events=maintenance_log_df)
+print(rep.summary_text())     # header: exposure framing; exposure is NOT life consumed
+rep.flags()                   # {engine: ["CHRONIC COLD OPERATION ...", "HIGH IDLE ...", "UNLOGGED OIL CHANGE ..."]}
+rep.exposure_frame()          # one row per engine x condition
+rep.oil_history_frame()       # oil service history: logged and/or detected
+rep.engines["SA00"].metrics   # derived values (each says "unavailable: why" when it cannot be computed)
+```
+
+### Derived values
+
+Each value below is either computed, or reported as `unavailable` with the reason: the
+signal isn't broadcast, the limit is missing from the engine config, or the row interval is
+too coarse. All times are counted in canonical rows × row interval.
+
+| Value | Definition |
+|---|---|
+| Idle % | running AND `idle_rpm_band.low ≤ rpm ≤ idle_rpm_band.high` (inclusive) AND load `<` `idle_load_cutoff` (strict). Load is SPN 92, falling back to SPN 513. A row with unknown load is not idle; the unknown-load share is reported. Flagged only above the config's `idle_pct_flag_threshold`. |
+| Idle / working / PTO split | idle vs running-not-idle. PTO and driving are reported as unavailable: there is no verified PTO SPN and vehicle speed is not decoded. |
+| Cold starts, time to temperature | a start whose coolant (or oil) temperature is below the config's low-temp cutoff; minutes until the cutoff is reached (median, p90, never reached). |
+| Low-temp running % | running below the cutoff, both overall and after the first 30 min. **Chronic cold** is flagged when the after-warm-up share exceeds 25 % (a program definition). |
+| Load histogram | % of running time per 10 % load band, plus an RPM × load table. |
+| Fuel-per-power drift | fuel rate ÷ (torque % × rpm) at ≥ 50 % load, compared per RPM × load bin against the first 40 h, with a Theil–Sen trend. A **proxy**, not calibrated BSFC. |
+| Cranking | crank duration and battery-voltage sag per start (SPN 168). Resolution is limited to the row interval, and the report says so. |
+| Torque spikes | a rise of ≥ 50 %-points between rows ≤ 2 s apart. Unavailable on coarser data. |
+| Oil consumption | oil level (SPN 98) slope per oil interval, in %-points/100 h. The sender's % is not converted to litres. |
+| Faults | DM1 episodes per 100 running h, by SPN/FMI, and clusters within 2 engine h. |
+| Hours since service | hours since the last oil change, logged or detected; the source is stated. |
+| Fan on, derate | fan-on uses SPN 975 when it is broadcast. Derate is unavailable: there is no verified derate SPN. |
+
+### Exposure report (time × severity)
+
+Each condition reports hours, severity-weighted exposure in a physical unit, episodes, hours
+per 100 running hours, the rate per 50 h period, and its definition:
+
+* oil pressure below this engine's own baseline (z-hours, broken down by RPM band; this is
+  the headline question, answered as exposure);
+* oil pressure below the configured minimums (kPa-hours);
+* oil and coolant over-temperature (°C-hours);
+* lugging: RPM ≤ the config's `lugging_rpm_max` (from the manual: below peak-torque speed)
+  at ≥ 80 % load;
+* cold oil at ≥ 75 % of rated RPM;
+* extended idling (> 10 min);
+* high load while cold;
+* hot shutdowns (stopped within 3 min of ≥ 75 % load);
+* low-temperature running after warm-up.
+
+Conditions that need a manual value are unavailable until the config has it. **Exposure is
+not life consumed.** Nothing converts it into life lost.
+
+### Oil-change detection from oil pressure / temperature vs RPM
+
+An oil change needs the engine stopped, so every engine-off boundary is a candidate. That
+means a gap between sessions, or a stop of ≥ 20 min. For each boundary the program compares
+this engine's data from 8 engine hours before with 8 hours after:
+
+* **Primary signal: oil pressure at the same RPM × oil temperature × load bins.** Used oil
+  thins, so pressure at a fixed operating point sags over the interval, and fresh oil
+  restores it: a step up.
+* **Supporting signals:**
+  * an oil level step up (SPN 98);
+  * a filter dp step down (new filter, SPN 99);
+  * a shift in oil temperature vs RPM/load;
+  * the change in the ln(pressure) vs oil-temperature slope at fixed RPM (viscosity
+    behaviour), which is reported.
+* **Self-calibrating:** every step is judged against this engine's own boundary-to-boundary
+  noise. A detection needs a robust z ≥ 3 and a step ≥ 1.5 %. Noise floors match bus
+  resolution: 4 kPa pressure, 0.4 % oil level.
+* **Exclusions:**
+  * A shift in the engine-off (zero) reading at the boundary means the **pressure sensor**
+    changed.
+  * A pressure step **down** is an oil-system step (a thinner grade? dilution?). It is not
+    counted as an oil change.
+  * A level rise without a pressure step is recorded as an `oil_level_rise` (oil added or
+    changed), not a confirmed change.
+* **Reconciliation with the maintenance log:**
+  * `logged; signature confirms`;
+  * `logged; no clear signature`;
+  * `detected; NOT in the maintenance log`, which raises the **UNLOGGED OIL CHANGE** flag.
+    Detected changes are passed to the Phase 2 analysis as confounders.
+* **Tracking:**
+  * the oil service history, with interval lengths;
+  * hours since the last change;
+  * per oil interval, the oil-pressure trend at fixed operating points (%/100 h) and oil
+    consumption.
+
+On synthetic data, all oil changes are found with no false detections across seeds and
+noise models, under normal, high-idle and abusive duty. **Limitation:** when oil runs
+chronically cold, pressure sits against the relief valve and the viscosity step can be
+invisible. Those changes appear only as oil-level rises, if SPN 98 is broadcast.
+
+The golden fixture `tests/fixtures/idle_golden.log` is a 70 s log covering every idle-rule
+edge case: inclusive band edge, strict load cutoff, not-available load and a duplicate
+frame. It is computed by hand in `tests/fixtures/idle_golden.md` (34 / 60 s = 56.67 %), and
+the test must match it exactly.
+
+The synthetic generator now also models oil ageing (viscosity loss, oil consumption, filter
+loading), maintenance at session starts, cranking with voltage sag, and an `abusive`
+scenario: lugging, high load from a cold start, and no cool-down before shutdown.
+
 ## Honest limitations
 
 * The SPN table is unverified (see above). A wrong byte position gives plausible-looking but
@@ -249,6 +353,9 @@ Re-baselining and the feedback loop come in Phase 4.
   They prove the plumbing (decoding, reassembly, resampling, equivalence, baselines, alerts)
   works. They say nothing about real-world accuracy. Thresholds were checked against several
   noise models and seeds so they are not tuned to one scenario, but real engines will differ.
+* Normal oil ageing makes healthy engines drift a few % between oil changes. Phase 3 detects
+  and tracks oil changes, but the learned baselines are not re-baselined at them until
+  Phase 4. Healthy test engines still produce zero alerts.
 * Without failure labels, alerts report deviation, exposure and trend. They never say a
   condition shortens life, and there is no life-loss formula anywhere.
 * CSV inputs carry no raw frames, so they have no TP/DM1 frame decoding. DM1 lamp and count

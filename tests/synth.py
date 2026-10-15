@@ -32,3 +32,36 @@ def engine(scenario, seed=0, noise_model=None, hours=300.0, engine_id="SA00"):
 def analyzed(scenario, seed=0, noise_model=None, hours=300.0):
     e = engine(scenario, seed, noise_model, hours)
     return e, analyze(e.canonical, {e.engine_id: synthetic_config(e)}, events=e.events)
+
+
+def usage_config(e, **drop):
+    """synthetic_config plus the usage cut-offs a manual (or fleet policy) would supply."""
+    from j1939pf.engine_config import parse_engine_config
+    c = synthetic_config(e)
+    p = e.profile
+    extra = {
+        "idle_rpm_band": {"low": p.idle_rpm - 100, "high": p.idle_rpm + 100, "unit": "rpm", "source": "synthetic engine"},
+        "idle_load_cutoff": {"value": 15, "unit": "%", "source": "synthetic engine"},
+        "coolant_low_temp_cutoff": {"value": 60, "unit": "degC", "source": "synthetic engine"},
+        "oil_low_temp_cutoff": {"value": 60, "unit": "degC", "source": "synthetic engine"},
+        "idle_pct_flag_threshold": {"value": 45, "unit": "%", "source": "synthetic fleet policy"},
+        "lugging_rpm_max": {"value": p.idle_rpm + 0.25 * (p.rated_rpm - p.idle_rpm), "unit": "rpm",
+                            "source": "synthetic engine"},
+    }
+    for k, v in drop.items():
+        if v is None:
+            extra.pop(k, None)
+            c.limits.pop(k, None)
+    x = parse_engine_config({"engine_id": e.engine_id, "limits": extra})
+    c.limits.update(x.limits)
+    c.idle_rpm_band = x.idle_rpm_band
+    return c
+
+
+@lru_cache(maxsize=64)
+def usage(scenario, seed=0, noise_model=None, with_log=True, oil_interval=250.0, hours=300.0):
+    from j1939pf.generator import generate_engine
+    from j1939pf.usage import usage_report
+    e = generate_engine("SA00", scenario, hours=hours, seed=seed, noise_model=noise_model,
+                        oil_change_interval_h=oil_interval)
+    return e, usage_report(e.canonical, {"SA00": usage_config(e)}, events=e.events if with_log else None)

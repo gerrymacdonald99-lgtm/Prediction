@@ -38,7 +38,7 @@ def test_stuck_relief_valve_low_pressure_at_high_rpm(seed):
     assert abs(a.start_h - e.truth["onset_engine_hours"]) < 5
     assert "Falsifiable" in a.explanation and "learned" in a.explanation
     assert a.sensor_verdict == "engine_suspected"
-    assert any(ev.startswith("ENGINE: deviation") for ev in a.sensor_evidence)
+    assert any(ev.startswith(("ENGINE: deviation", "ENGINE: pressure no longer rises")) for ev in a.sensor_evidence)
     assert "gauge" in a.check_next[0] and "level" in a.check_next[1]
     assert any("relief" in s for s in a.check_next)
     # layer (a): placeholder rated-speed minimum breached too, and labelled as a placeholder
@@ -220,11 +220,11 @@ def test_end_to_end_candump_to_alert(tmp_path):
     from j1939pf.config import load_defaults
     from j1939pf.generator import render_candump
     from j1939pf.pipeline import canonical_from_candump
-    e = generate_engine("SA00", "stuck_relief_valve", hours=45, seed=1, fault={"onset_h": 25.0})
+    e = generate_engine("SA00", "stuck_relief_valve", hours=60, seed=1, fault={"onset_h": 40.0})
     log = tmp_path / "bus.log"
     render_candump(e.canonical, log)
     params = load_defaults(overrides={"canonical": {"resample_interval_s": 10, "gap_s": 60},
-                                      "baseline": {"learning_period_h": 15}})
+                                      "baseline": {"learning_period_h": 25}})
     parsed = canonical_from_candump(log, config=params)
     r = analyze(parsed.canonical, {"SA00": synthetic_config(e)}, dtc_episodes=parsed.dtc_episodes, params=params)
     c = [a for a in r.alerts if a.layer == "c" and a.direction == "low"]

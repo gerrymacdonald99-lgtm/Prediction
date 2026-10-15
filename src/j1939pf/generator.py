@@ -14,7 +14,12 @@ Scenarios (fault onset is in engine hours *into the record*):
   sensor_drift        oil pressure SENSOR reading drifts (engine is fine)
   high_idle           healthy engine, idle-dominated duty cycle
   cold_operation      healthy engine run chronically cold (thermostat stuck open, cold ambient, light load)
-Events (maintenance log): oil change (+filter), oil-grade change, sensor replacement.
+  abusive             healthy engine, abusive use: lugging, high load straight after a cold start,
+                      shutdown straight from high load (no cool-down idle)
+Events (maintenance log): oil change (+filter), oil-grade change, sensor replacement. Events take effect
+at the start of a session (the engine is stopped for maintenance). Oil ageing is modelled: used oil
+slowly loses viscosity (pressure at a fixed RPM/oil temperature sags), oil level falls with consumption
+and the filter loads slightly; an oil change restores all three.
 """
 
 from __future__ import annotations
@@ -28,15 +33,17 @@ from scipy.signal import lfilter
 from .spn_table import SpnTable, load_spn_table
 
 SCENARIOS = ("healthy", "bearing_wear", "clogged_filter", "stuck_relief_valve", "failing_pump",
-             "sensor_drift", "high_idle", "cold_operation")
+             "sensor_drift", "high_idle", "cold_operation", "abusive")
 NOISE_MODELS = ("gaussian", "student_t", "ar1")
 START = pd.Timestamp("2024-01-01T00:00:00Z")
 
-_DUTY = {  # mode probabilities: idle, low, mid, rated
-    "normal": (0.20, 0.20, 0.35, 0.25),
-    "high_idle": (0.65, 0.15, 0.12, 0.08),
-    "light": (0.40, 0.40, 0.15, 0.05),
+_DUTY = {  # mode probabilities: idle, low, mid, rated, lug
+    "normal": (0.20, 0.20, 0.35, 0.25, 0.0),
+    "high_idle": (0.65, 0.15, 0.12, 0.08, 0.0),
+    "light": (0.40, 0.40, 0.15, 0.05, 0.0),
+    "abusive": (0.10, 0.15, 0.30, 0.25, 0.20),
 }
+_MODES = ["idle", "low", "mid", "rated", "lug"]
 
 _DEFAULT_FAULT = {
     "bearing_wear": {"onset_h": 80.0, "rate_per_h": 0.0012},       # fraction of pressure lost per hour
@@ -110,17 +117,31 @@ def _noise(rng, model: str, n: int, sigma: float) -> np.ndarray:
 
 
 def _day_blocks(rng, duty: str, session_h: float):
-    """List of (mode, seconds). mode in idle/low/mid/rated/off."""
+    """List of (mode, seconds). mode in idle/low/mid/rated/lug/off."""
     probs = _DUTY[duty]
+    abusive = duty == "abusive"
     blocks = [("off", float(rng.uniform(60, 180)))]  # key on, engine not yet started
+    if abusive:
+        blocks.append(("rated", float(rng.uniform(300, 900))))  # straight to high load from a cold start
+    else:
+        blocks.append(("idle", float(rng.uniform(120, 300))))   # warm-up idle
+
+    def stop():
+        if not abusive:
+            blocks.append(("idle", float(rng.uniform(180, 300))))  # cool-down idle before shutdown
+        elif blocks[-1][0] != "rated":
+            blocks.append(("rated", float(rng.uniform(120, 300))))  # shut down straight from high load
+
     elapsed = 0.0
     while elapsed < session_h * 3600:
         if rng.random() < 0.03:
+            stop()
             blocks.append(("off", float(rng.uniform(300, 1200))))  # mid-shift stop, key on
-        mode = rng.choice(["idle", "low", "mid", "rated"], p=probs)
+        mode = rng.choice(_MODES, p=probs)
         dur = float(np.clip(rng.exponential(480), 60, 1800))
         blocks.append((str(mode), dur))
         elapsed += dur
+    stop()
     blocks.append(("off", float(rng.uniform(60, 120))))
     return blocks
 
@@ -131,6 +152,7 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
                     grade_change_at_h: float | None = None, grade_factor: float = 0.93,
                     sensor_replacement_at_h: float | None = None, sensor_offset_step_kpa: float = 6.0,
                     missing_frac: float = 0.002, profile: EngineProfile | None = None,
+                    oil_degradation: float = 0.03, oil_consumption_pct_per_h: float = 0.012,
                     table: SpnTable | None = None, start: pd.Timestamp = START) -> SyntheticEngine:
     if scenario not in SCENARIOS:
         raise ValueError(f"unknown scenario {scenario}; choose from {SCENARIOS}")
@@ -141,15 +163,17 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
         prof.noise_model = noise_model
     fp = dict(_DEFAULT_FAULT.get(scenario, {}))
     fp.update(fault or {})
-    duty = {"high_idle": "high_idle", "cold_operation": "light"}.get(scenario, "normal")
+    duty = {"high_idle": "high_idle", "cold_operation": "light", "abusive": "abusive"}.get(scenario, "normal")
     cold = scenario == "cold_operation"
 
     mode_rpm = {"off": lambda: 0.0,
                 "idle": lambda: prof.idle_rpm + rng.normal(0, 10),
                 "low": lambda: prof.idle_rpm + (prof.rated_rpm - prof.idle_rpm) * rng.uniform(0.2, 0.45),
                 "mid": lambda: prof.idle_rpm + (prof.rated_rpm - prof.idle_rpm) * rng.uniform(0.45, 0.85),
-                "rated": lambda: prof.rated_rpm - rng.uniform(0, 60)}
-    mode_load = {"off": (0, 0), "idle": (4, 12), "low": (20, 40), "mid": (40, 75), "rated": (78, 100)}
+                "rated": lambda: prof.rated_rpm - rng.uniform(0, 60),
+                "lug": lambda: prof.idle_rpm + (prof.rated_rpm - prof.idle_rpm) * rng.uniform(0.05, 0.2)}
+    mode_load = {"off": (0, 0), "idle": (4, 12), "low": (20, 40), "mid": (40, 75), "rated": (78, 100),
+                 "lug": (88, 100)}
 
     t_parts, rpm_parts, load_parts, seg_parts, amb_parts = [], [], [], [], []
     run_s = 0.0
@@ -165,6 +189,8 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
         rpm = lfilter([1 - a], [1, -a], rpm_t, zi=[0.0])[0]
         rpm[rpm_t == 0] = 0.0
         rpm = np.where(rpm_t > 0, rpm + rng.normal(0, 4, rpm.size), 0.0)
+        crank = (rpm_t > 0) & (np.r_[0.0, rpm_t[:-1]] == 0)
+        rpm[crank] = rng.uniform(120, 200, int(crank.sum()))  # cranking row
         load = np.where(rpm > 0, load_t + rng.normal(0, 2, rpm.size), 0.0)
         t0 = start + pd.Timedelta(days=day, hours=float(rng.uniform(5.5, 7.5)))
         t_parts.append(t0.value // 1000 + (np.arange(rpm.size) * dt_s * 1e6).astype(np.int64))
@@ -206,39 +232,51 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
             o = a_off * o + (1 - a_off) * amb[i]
         coolant[i], oil_t[i] = c, o
 
-    # --- events --------------------------------------------------------------------
-    events = []
-    oil_change_h = []
+    # --- events: maintenance happens with the engine stopped, i.e. at a session start --------
+    idx = np.arange(n)
+    seg_start = np.flatnonzero(np.r_[True, seg[1:] != seg[:-1]])
+
+    def at_session(h):
+        cand = seg_start[rel_h[seg_start] >= h]
+        return int(cand[0]) if cand.size and cand[0] > 0 else None
+
+    events = []  # (type, row index, detail)
+    change_idx = []
     if oil_change_interval_h:
         k = 1
         while k * oil_change_interval_h < rel_h[-1]:
-            oil_change_h.append(k * oil_change_interval_h)
+            i = at_session(k * oil_change_interval_h)
+            if i is not None and i not in change_idx:
+                change_idx.append(i)
+                events.append(("oil_change", i, "oil and filter changed"))
             k += 1
-    for h in oil_change_h:
-        events.append(("oil_change", h, "oil and filter changed"))
-    if grade_change_at_h is not None:
-        events.append(("oil_grade_change", grade_change_at_h, f"oil grade changed (synthetic viscosity factor {grade_factor})"))
-    if sensor_replacement_at_h is not None:
-        events.append(("sensor_replacement", sensor_replacement_at_h, "oil pressure sensor replaced"))
+    grade_idx = at_session(grade_change_at_h) if grade_change_at_h is not None else None
+    if grade_idx is not None:
+        events.append(("oil_grade_change", grade_idx, f"oil grade changed (synthetic viscosity factor {grade_factor})"))
+    sensor_idx = at_session(sensor_replacement_at_h) if sensor_replacement_at_h is not None else None
+    if sensor_idx is not None:
+        events.append(("sensor_replacement", sensor_idx, "oil pressure sensor replaced"))
+    events.sort(key=lambda e: e[1])
+
+    # oil age (engine hours since the last change); the record starts part-way through an interval
+    oil_age = rel_h + float(rng.uniform(0, 60))
+    for i in change_idx:
+        oil_age = np.where(idx >= i, rel_h - rel_h[i], oil_age)
 
     # --- oil pressure (true) ---------------------------------------------------------
     rf = np.clip((rpm - prof.idle_rpm) / (prof.rated_rpm - prof.idle_rpm), 0, 1)
     visc = np.clip(np.exp(-prof.visc_k * (oil_t - 95.0)), 0.7, 1.9)
-    fresh = np.zeros(n)
-    for h in oil_change_h:
-        fresh += np.where(rel_h >= h, 0.015 * np.exp(-(rel_h - h) / 30.0), 0.0)
-    visc = visc * (1 + fresh)
-    if grade_change_at_h is not None:
-        visc = visc * np.where(rel_h >= grade_change_at_h, grade_factor, 1.0)
+    # used oil thins (shear, dilution); fresh oil is slightly thicker for its first tens of hours
+    visc = visc * (1 - oil_degradation * (1 - np.exp(-oil_age / 150.0))) * (1 + 0.015 * np.exp(-oil_age / 30.0))
+    if grade_idx is not None:
+        visc = visc * np.where(idx >= grade_idx, grade_factor, 1.0)
     p = (prof.p_idle_kpa + (prof.p_rated_kpa - prof.p_idle_kpa) * rf ** 0.8) * visc
     p = np.minimum(p, prof.p_relief_kpa)
 
     # filter differential pressure (flow ~ rpm, viscosity) and restriction growth
-    since_change = rel_h.copy()
-    for h in oil_change_h:
-        since_change = np.where(rel_h >= h, rel_h - h, since_change)
+    since_change = oil_age
     flow = 0.25 + 0.75 * rf ** 1.3
-    restriction = np.ones(n)
+    restriction = 1.0 + 0.0001 * oil_age  # a healthy filter loads slightly over its interval
     onset = fp.get("onset_h", np.inf)
     after = np.clip(rel_h - onset, 0, None)
     if scenario == "clogged_filter":
@@ -265,10 +303,10 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
     offset = np.zeros(n)
     if scenario == "sensor_drift":
         offset += fp["kpa_per_h"] * after
-        if sensor_replacement_at_h is not None:
-            offset = np.where(rel_h >= sensor_replacement_at_h, 0.0, offset)
-    if sensor_replacement_at_h is not None:
-        offset += np.where(rel_h >= sensor_replacement_at_h, sensor_offset_step_kpa, 0.0)
+        if sensor_idx is not None:
+            offset = np.where(idx >= sensor_idx, 0.0, offset)
+    if sensor_idx is not None:
+        offset += np.where(idx >= sensor_idx, sensor_offset_step_kpa, 0.0)
     noise = _noise(rng, prof.noise_model, n, prof.noise_kpa)
     reading = np.clip(p + offset + np.where(running, noise, 0.3 * noise), 0, None)
     dp_reading = np.clip(dp + rng.normal(0, 1.0, n) * np.where(running, 1, 0.3), 0, None)
@@ -276,6 +314,9 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
     # --- other signals -----------------------------------------------------------------
     fuel = np.where(running, 2.0 + 0.00006 * rpm * (10 + load) * 3, 0.0)
     torque = np.where(running, load * 0.95, 0.0)
+    cranking = (rpm > 0) & ~running
+    batt = np.where(running, 14.1, np.where(cranking, 10.3, 12.6)) + rng.normal(0, 0.08, n)
+    oil_level = 80.0 - oil_consumption_pct_per_h * oil_age + rng.normal(0, 0.3, n)
     df = pd.DataFrame({
         "engine_id": engine_id,
         "t": pd.to_datetime(t_us, unit="us", utc=True),
@@ -283,7 +324,8 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
         "actual_torque_pct": _quantize(table, "actual_torque_pct", torque),
         "engine_speed_rpm": _quantize(table, "engine_speed_rpm", rpm),
         "load_at_speed_pct": _quantize(table, "load_at_speed_pct", load),
-        "oil_level_pct": _quantize(table, "oil_level_pct", np.full(n, 80.0) + rng.normal(0, 0.3, n)),
+        "oil_level_pct": _quantize(table, "oil_level_pct", oil_level),
+        "battery_v": _quantize(table, "battery_v", batt),
         "oil_pressure_kpa": _quantize(table, "oil_pressure_kpa", reading),
         "oil_filter_dp_kpa": _quantize(table, "oil_filter_dp_kpa", dp_reading),
         "coolant_temp_c": _quantize(table, "coolant_temp_c", coolant),
@@ -298,11 +340,13 @@ def generate_engine(engine_id: str = "SA00", scenario: str = "healthy", *, hours
         df.loc[rng.random(n) < missing_frac, "oil_pressure_kpa"] = np.nan
 
     ev = pd.DataFrame(
-        [{"engine_id": engine_id, "t": df["t"].iloc[int(np.searchsorted(rel_h, h))] if h <= rel_h[-1] else pd.NaT,
-          "engine_hours": prof.start_hours + h, "event_type": e, "detail": d} for e, h, d in events],
+        [{"engine_id": engine_id, "t": df["t"].iloc[i], "engine_hours": float(hours_abs[i]), "event_type": e,
+          "detail": d} for e, i, d in events],
         columns=["engine_id", "t", "engine_hours", "event_type", "detail"])
     truth = {"scenario": scenario, "kind": {"sensor_drift": "sensor", "high_idle": "usage",
-                                            "cold_operation": "usage", "healthy": "none"}.get(scenario, "engine"),
+                                            "cold_operation": "usage", "abusive": "usage",
+                                            "healthy": "none"}.get(scenario, "engine"),
+             "oil_change_engine_hours": [float(hours_abs[i]) for i in change_idx],
              "onset_engine_hours": prof.start_hours + onset if np.isfinite(onset) else None,
              "fault_params": fp, "noise_model": prof.noise_model, "start_hours": prof.start_hours}
     return SyntheticEngine(engine_id, scenario, df, ev, truth, prof)

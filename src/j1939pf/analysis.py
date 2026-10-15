@@ -116,8 +116,9 @@ def _finish(alert: Alert, prep: Prepared, sb: SignalBaseline | None, window: np.
     alert.sensor_verdict = sa.verdict
     alert.sensor_evidence = sa.evidence
     alert.confounders = _confounders(prep, events, conf_h[0], conf_h[1], ref_window, window, alert.start_h)
-    pattern_text = next((e.split(": ", 1)[1] for e in sa.evidence if e.startswith(("ENGINE: deviation",
-                                                                                   "SENSOR (weak): deviation"))), "")
+    pattern_text = next((e.split(": ", 1)[1] for e in sa.evidence
+                         if e.startswith(("ENGINE: deviation", "ENGINE: pressure no longer rises",
+                                          "SENSOR (weak): deviation"))), "")
     extra = ""
     if sa.verdict == "sensor_suspected":
         extra = "Sensor evidence is present: verify the reading before concluding the engine is at fault."

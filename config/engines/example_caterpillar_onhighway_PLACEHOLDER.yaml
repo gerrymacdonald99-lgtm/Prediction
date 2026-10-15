@@ -15,4 +15,5 @@ limits:
   coolant_low_temp_cutoff: null
   oil_low_temp_cutoff:     null
   idle_pct_flag_threshold: null
+  lugging_rpm_max:        null
 load_signal: {spn: 92, fallback_spn: 513}

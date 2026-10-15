@@ -28,3 +28,40 @@ sources:
   # Example: {0: engine_1, 1: engine_2, 61: engine_1}   (61 = 0x3D aftertreatment ECU)
   engine_map: {}
   ignore_source_addresses: []
+
+# ---------------------------------------------------------------------------
+# Baseline / detection program defaults (phase 2). TUNABLE, NOT engine specs.
+baseline:
+  signals: [oil_pressure_kpa, oil_filter_dp_kpa]   # learned per (RPM x oil temp x load) bin
+  learning_period_h: 40          # engine hours of eligible data that form the fixed reference
+  min_healthy_samples: 30        # rows needed before a bin is trusted
+  min_healthy_sessions: 3        # ...and they must come from at least this many separate segments (days/sessions)
+  min_block_samples: 10          # rows needed for a bin to contribute to a trend block
+  rpm_bin_width: 100
+  oil_temp_bin_width_c: 5
+  load_bin_width_pct: 25
+  spread_floor_steps: 1.0        # spread floor in units of the signal's bus resolution (oil pressure: 4 kPa)
+  spread_floor_rel: 0.025        # ...and at least this fraction of the bin median
+  block_h: 5                     # online update / trend point every N engine hours
+  online_alpha: 0.2              # online baseline update weight per block
+  learn_z_max: 3.0               # a bin's block median further than this (in spreads) from its baseline is not learned
+  drift_cap_rel: 0.03            # online baseline may move at most this fraction from the reference
+  running_rpm_min: 300           # below this the engine is treated as not running
+  startup_grace_s: 60            # rows this soon after a start are not judged or learned from
+
+alerts:
+  sustained_run_s: 120           # a condition must persist this long to become an alert
+  z_alert: 4.0                   # layer (c) |z| threshold
+  z_severe: 8.0
+  merge_gap_engine_h: 10.0       # runs closer than this many ENGINE hours merge into one alert episode
+  rated_speed_tolerance_rpm: 100 # rated-speed minimum applies within this many rpm of the configured rated rpm
+  drift_alert_rel: 0.04          # layer (d): engine-level drift vs reference that triggers a trend alert
+  trend_window_h: 60
+  trend_min_points: 6
+
+sensor_check:
+  zero_check_signals: [oil_pressure_kpa, oil_filter_dp_kpa]
+  zero_check_settle_s: 30        # engine stopped this long before an engine-off reading counts
+  zero_check_tolerance_steps: 2  # allowed engine-off reading shift, in bus resolution steps
+  err_fraction_suspect: 0.01     # >1 % error-coded samples in the window -> sensor/wiring suspected
+  sensor_fmis: [2, 3, 4, 5, 6, 8, 10, 13]  # J1939-73 FMIs describing the measurement, not the quantity

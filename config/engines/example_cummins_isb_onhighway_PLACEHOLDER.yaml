@@ -1,0 +1,18 @@
+# PLACEHOLDER - ON-HIGHWAY TYPICAL VALUES, NOT FROM ANY SPECIFIC ENGINE'S MANUAL.
+# Override every value from your engine's manual before trusting layer (a).
+# No industrial (QSK/C32/MTU) values are included: those MUST come from the manual.
+engine_id: EXAMPLE_CUMMINS_ISB
+description: "Example only - Cummins ISB on-highway placeholder minimums"
+oil_grade: null
+limits:
+  oil_pressure_min_idle:  {value: 10, unit: psi, placeholder: true, source: "PLACEHOLDER: Cummins ISB ~10 psi at idle; override from manual"}
+  oil_pressure_min_rated: {value: 30, unit: psi, placeholder: true, source: "PLACEHOLDER: Cummins ISB ~30 psi at rated; override from manual"}
+  oil_temp_max:           {value: 248, unit: degF, placeholder: true, source: "PLACEHOLDER, UNVERIFIED: ~248 F; override from manual"}
+  coolant_temp_max:       null   # not provided - layer (a) disabled for coolant until set from the manual
+  rated_rpm:              null   # REQUIRED from the manual for the rated-speed minimum to be checked
+  idle_rpm_band:          null   # REQUIRED from the manual for the idle minimum to be scoped to idle
+  idle_load_cutoff:       null
+  coolant_low_temp_cutoff: null
+  oil_low_temp_cutoff:     null
+  idle_pct_flag_threshold: null
+load_signal: {spn: 92, fallback_spn: 513}

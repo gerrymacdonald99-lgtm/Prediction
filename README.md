@@ -17,14 +17,14 @@ and which way it is trending". Nothing stronger.
 
 ## Build status
 
-The program is built in five phases. **Only Phase 1 (parser and canonical series) is
-implemented.** Later-phase modules (baselines, alerts, exposure reports, correlations,
+The program is built in five phases. **Phases 1 and 2 are implemented.** Later-phase
+modules (exposure reports, correlations, change-point re-baselining, feedback loop,
 anomaly/survival models, HTML reports, CLI) do not exist yet. There are no stubs for them.
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Parser, TP reassembly, SPN decode, canonical series | done |
-| 2 | Synthetic generator, baseline layers (a)–(d), core alerts | not started |
+| 2 | Synthetic generator, baseline layers (a)–(d), core alerts | done |
 | 3 | Derived values, exposure reports | not started |
 | 4 | Correlations, change-points, feedback loop | not started |
 | 5 | Anomaly detection, supervised/survival, reporting, CLI | not started |
@@ -131,12 +131,126 @@ One row per engine per `resample_interval_s` (default 1 s):
 `config/defaults.yaml` holds **tunable program defaults, not engine specifications**:
 interval, gap, hold, TP timeouts and DTC episode gap.
 
-## Honest limitations (Phase 1)
+## Phase 2: per-engine baselines and alerts
+
+```python
+from j1939pf.analysis import analyze
+from j1939pf.engine_config import load_engine_configs
+
+r = analyze(parsed.canonical, load_engine_configs("config/my_engines/"),
+            dtc_episodes=parsed.dtc_episodes, events=maintenance_log_df)
+print(r.summary_text())        # header always states the exposure-not-life-loss framing
+r.alerts_frame()               # one row per alert episode
+r.status["SA00"]               # learning period, layer availability, notes
+r.alert_data(r.alerts[0])      # the canonical rows (with expected value and z) behind an alert
+```
+
+### Writing the engine config from the manual
+
+Copy `config/engines/TEMPLATE.yaml`, one file per engine. Every limit takes
+`{value, unit, source}`, where `source` is the manual section or page. Units are converted
+(psi/kPa/bar, degF/degC). **No limit has a default.** If a limit is missing, layer (a) is
+disabled for that signal, and the status says so. The learned layers (b)–(d) still run.
+
+The `example_*_PLACEHOLDER.yaml` files hold the on-highway placeholder minimums only:
+Cummins ~15/35 psi, Caterpillar ~10–20/30–45 psi (lower bound used), Cummins ISB ~10/30 psi.
+The ~248 °F maximum oil temperature is marked UNVERIFIED. All of these are flagged
+`placeholder: true`, and every alert that uses one says so. There are no industrial
+(QSK/C32/MTU) values; take those from the manual. Rated RPM and the idle band are left empty
+in the examples on purpose.
+
+### The four layers
+
+| Layer | What | Learned from |
+|---|---|---|
+| (a) | Manual thresholds: oil pressure minimum (at all running speeds), minimum at rated speed (within ±100 rpm of the configured rated RPM), max oil and coolant temperature | the engine config only |
+| (b) | Per-bin baseline: RPM (100 rpm) × oil temperature (5 °C) × load (25 %); median and robust spread | this engine's first 40 eligible engine hours |
+| (c) | z = (actual − expected) / spread, alert when \|z\| ≥ 4 for ≥ 120 s | (b) plus a capped online update |
+| (d) | Engine-level drift vs the fixed early-hours reference, with a Theil–Sen slope and 95 % CI | (b) |
+
+* **Eligible (learnable) rows**: engine running, past the 60 s startup grace, no active DM1
+  code, reading decoded OK (no error/not-available encoding). If DM1 is not broadcast, the
+  status says that learning is unguarded by fault codes.
+* **Trusted bin**: at least 30 samples from at least 3 separate sessions. The spread
+  includes session-to-session variation and is floored at the bus resolution (4 kPa for oil
+  pressure) and at 2.5 % of the bin median, so quantization cannot inflate z-scores.
+* **Online learning guardrails**: after the learning period a bin's expected value follows
+  new data slowly, and only when that block is not itself anomalous. It never moves more
+  than 3 % from the reference (the drift cap). Bins that hit the cap are counted, and the
+  drift alert says "flagged, not absorbed". New bins are learned after the learning period
+  only while the engine is near its reference.
+* **"Drift flagged before threshold"**, as tested: a layer (d) alert fires when the
+  engine-level drift against the fixed reference window passes −4 % and the slope's 95 % CI
+  excludes zero. The test asserts that this happens before any layer (a) alert, while the
+  engine's oil pressure (1st percentile, idle and rated) is still above the configured
+  minimums.
+* **New engines** announce `LEARNING PERIOD: x of 40 engine hours observed`. Until then only
+  layer (a) judges them. Baselines are per engine: nothing is copied between engines, and an
+  engine's model is identical whether it is analysed alone or with its fleet (tested).
+* Runs less than 10 engine hours apart merge into one alert episode, so a persistent fault
+  produces one alert rather than one per day.
+* All of these numbers are **tunable program defaults** in `config/defaults.yaml`. They are
+  not engine specs.
+
+### Reading an alert
+
+Each alert records the following:
+
+* the signal and layer;
+* the operating point (RPM, oil temperature, load, dominant bin);
+* expected vs actual values (kPa and psi), z, and duration;
+* a severity: watch, warning, or critical (critical is for manual-limit breaches);
+* a **falsifiable explanation**;
+* confounders: maintenance events in the window, marked as before or after the onset, and
+  ambient temperature shifts;
+* **what to check next**, cheapest first: the reading itself (mechanical gauge,
+  connector/wiring, DTCs), then oil level and grade, then the filter, then mechanical
+  causes.
+
+### Sensor fault or engine wear?
+
+Before an alert blames the engine, `sensor_check` weighs the evidence:
+
+* DM1 codes for the SPN with measurement-circuit FMIs (2, 3, 4, 5, 6, 8, 10, 13);
+* error encodings in the samples;
+* an **engine-off zero check**: a stopped engine reads ~0 kPa, so an offset there is the
+  sensor;
+* the deviation pattern: high-RPM-only and proportional patterns point to the oil system,
+  while a uniform-kPa pattern looks like a sensor offset;
+* corroborating signals: filter dp rising, oil level falling.
+
+ECU low-pressure codes (FMI 1/17/18) come from the same sensor and are reported as *not
+independent*. The verdict is `sensor_suspected`, `engine_suspected` or `undetermined`.
+Readings clip at 0 kPa, so a sensor drifting *low* cannot be told apart from uniform wear by
+the zero check. Such cases are reported as `undetermined`, not guessed.
+
+### Synthetic generator (`j1939pf.generator`)
+
+The generator is seeded and works at canonical-series level. `render_candump` turns its
+output into J1939 frames, so the whole pipeline can run end to end.
+
+* Scenarios: healthy, bearing wear, clogged filter, stuck relief valve, failing pump, sensor
+  drift, high-idle duty cycle, chronic cold operation.
+* Events: oil change, oil-grade change, sensor replacement.
+* Each engine draws its own profile, with gaussian, Student-t or AR(1) noise, jittered duty
+  cycles and missing samples.
+* Every generator coefficient is a toy-model parameter, **not an engine specification**.
+* Tests require zero alerts across healthy, high-idle and cold-operation engines under all
+  three noise models and multiple seeds, plus detection of every fault scenario.
+
+Phase 2 lists maintenance events as confounders but does not yet re-baseline after them.
+Re-baselining and the feedback loop come in Phase 4.
+
+## Honest limitations
 
 * The SPN table is unverified (see above). A wrong byte position gives plausible-looking but
   wrong numbers, so verify the signals you depend on.
-* The tests use self-built bus data. They prove the plumbing (decoding, reassembly,
-  resampling, equivalence) works. They say nothing about real-world accuracy.
+* **Synthetic-data caveat:** the tests run on self-built bus data and self-scripted faults.
+  They prove the plumbing (decoding, reassembly, resampling, equivalence, baselines, alerts)
+  works. They say nothing about real-world accuracy. Thresholds were checked against several
+  noise models and seeds so they are not tuned to one scenario, but real engines will differ.
+* Without failure labels, alerts report deviation, exposure and trend. They never say a
+  condition shortens life, and there is no life-loss formula anywhere.
 * CSV inputs carry no raw frames, so they have no TP/DM1 frame decoding. DM1 lamp and count
   columns can be mapped if the logger exports them.
 * A single corrupted far-future timestamp would make later samples look "late". Such drops

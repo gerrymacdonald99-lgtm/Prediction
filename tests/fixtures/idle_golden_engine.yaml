@@ -1,0 +1,6 @@
+# Engine config for the idle golden fixture (values are the fixture's definition, not a real engine)
+engine_id: SA00
+limits:
+  idle_rpm_band: {low: 600, high: 800, unit: rpm, source: "golden fixture definition"}
+  idle_load_cutoff: {value: 15, unit: "%", source: "golden fixture definition"}
+load_signal: {spn: 92, fallback_spn: 513}

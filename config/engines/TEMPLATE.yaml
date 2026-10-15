@@ -1,0 +1,21 @@
+# Per-engine configuration. EVERY number must come from THIS engine's manual.
+# Leave a limit null if you do not have it: layer (a) is then disabled for that
+# signal (and says so); learned layers (b)-(d) still run.
+engine_id: SA00          # canonical engine id (SAxx) or the name used in sources.engine_map
+description: ""
+oil_grade: null          # e.g. "15W-40" (used to explain grade-change confounders)
+limits:
+  oil_pressure_min_idle:  null   # {value: .., unit: psi|kPa|bar, source: "manual section/page"}
+  oil_pressure_min_rated: null
+  oil_temp_max:           null   # {value: .., unit: degF|degC, source: ..}
+  coolant_temp_max:       null
+  rated_rpm:              null   # {value: .., unit: rpm, source: ..}
+  idle_rpm_band:          null   # {low: .., high: .., unit: rpm, source: ..}
+  idle_load_cutoff:       null   # {value: .., unit: "%", source: ..}
+  coolant_low_temp_cutoff: null
+  oil_low_temp_cutoff:     null
+  idle_pct_flag_threshold: null  # {value: .., unit: "%", source: ..}  (fleet policy is a valid source)
+  lugging_rpm_max:        null   # below this RPM under high load = lugging (manual: below peak-torque speed)
+load_signal:
+  spn: 92                 # SPN 92 percent load at current speed (default)
+  fallback_spn: 513       # SPN 513 actual percent torque if 92 is not broadcast
